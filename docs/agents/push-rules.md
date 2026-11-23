@@ -30,6 +30,12 @@ packages/teamwork/test/host.test.js ^    token[:] draft\.token,$
 packages/swarm/test/board.test.js ^  const parsed [=] parseMentions\('hi [@]worker-1, mail a[@]b\.com and [@]all [@]#ops; x[@]#no'\);$
 packages/teamwork/test/host-runtime.test.js ^    await writeFile\(path\.join\(workspace, 'accept-pass\.mjs'\), "console\.log\('acceptance ok'\)\\n"\);$
 packages/teamwork/test/host-runtime.test.js ^    await writeFile\(path\.join\(workspace, 'general-pass\.mjs'\), "console\.log\('general acceptance ok'\)\\n"\);$
+packages/teamwork/src/host-command.js ^            token[:] draft\.token,$
+packages/boost/src/reveal.js ^  const token [=] execution ![=][=] null && typeof execution [=][=][=] 'object' \? execution\.token [:] undefined$
+packages/boost/src/reveal.js ^  const token [=] exec ![=][=] null && typeof exec [=][=][=] 'object' \? exec\.token [:] undefined$
+packages/boost/src/reveal.js ^  const token [=] execution\.token$
+packages/boost/test/roles.test.js ^    \['string token', \{ \.\.\.base, token[:] 'not-a-symbol' \}\],$
+packages/swarm/src/host-tools.js ^              token[:] exec\.token,$
 packages/swarm/package-lock.json ^packages/swarm/package-lock\.json$
 packages/teamwork/package-lock.json ^packages/teamwork/package-lock\.json$
 ```
