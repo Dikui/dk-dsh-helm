@@ -951,6 +951,16 @@ function readCursor(draft, member, readSeqs) {
   return cursor;
 }
 
+function recordRead(draft, actor, delivered, now) {
+  const cursor = readCursor(draft, actor, delivered);
+  actor.lastReadSeq = cursor;
+  actor.updatedAtSeq = now;
+  draft.pendingWakes = draft.pendingWakes.filter(
+    (item) => item.sessionId !== actor.sessionId || (item.seq > cursor && !delivered.has(item.seq)),
+  );
+  return cursor;
+}
+
 function readBoard(draft, actor, action, now) {
   const peek = action.peek === true;
   // A preview selects the exact page for a tool result that has not reached the
@@ -991,12 +1001,10 @@ function readBoard(draft, actor, action, now) {
     seqs = unique;
   }
   const candidates = visiblePostList(draft, actor, {
-    since: seqs ? 0 : since,
+    since: seqs && sinceGiven === null ? 0 : since,
     seqs,
     channel: action.channel,
   });
-  const views = candidates.map(messageView);
-  const blocks = views.map(indentMessageBlock);
 
   // Size each page by the exact JSON the model sees. The provisional envelope
   // uses the widest possible continuation metadata, so the selected page is a
@@ -1007,29 +1015,23 @@ function readBoard(draft, actor, action, now) {
     headSeq: draft.seq,
     hasMore: true,
     peek,
-    ...(seqs ? { nextSeqs: seqs } : { nextSince: draft.seq }),
+    nextSince: draft.seq,
   };
-  const fixedBytes = JSON.stringify({ ok: true, ...provisional }, null, 2).length - 2;
-  const cap = Math.min(views.length, limit);
-  let take = 0;
-  let blockBytes = 0;
-  for (let index = 0; index < cap; index += 1) {
-    blockBytes += blocks[index].length;
-    const arrayBytes = 6 + blockBytes + 2 * index;
-    if (fixedBytes + arrayBytes > READ_RENDER_LIMIT) break;
-    take = index + 1;
+  const fixedChars = JSON.stringify({ ok: true, ...provisional }, null, 2).length - 2;
+  const page = [];
+  let blockChars = 0;
+  for (const post of candidates) {
+    const message = messageView(post);
+    blockChars += indentMessageBlock(message).length;
+    const arrayChars = 6 + blockChars + 2 * page.length;
+    // Even when its JSON escapes exceed the budget, a legal singleton must
+    // remain retrievable in full. Never serialize the remaining backlog.
+    if (page.length && fixedChars + arrayChars > READ_RENDER_LIMIT) break;
+    page.push(message);
+    if (page.length === limit) break;
   }
-  // A single legal post may exceed the budget after escaping. Return it whole
-  // and let the cursor advance; otherwise the reader could never retrieve it.
-  if (take === 0 && views.length > 0) take = 1;
-
-  const page = views.slice(0, take);
-  const hasMore = take < views.length;
-  const continuation = hasMore
-    ? seqs
-      ? { nextSeqs: views.slice(take).map((message) => message.seq) }
-      : { nextSince: page[page.length - 1].seq }
-    : {};
+  const hasMore = page.length < candidates.length;
+  const continuation = hasMore ? { nextSince: page.at(-1).seq } : {};
   const result = {
     messages: page,
     lastReadSeq: peek ? actor.lastReadSeq : undefined,
@@ -1040,24 +1042,15 @@ function readBoard(draft, actor, action, now) {
   };
   if (peek) return ok(result);
 
-  const cursor = readCursor(draft, actor, new Set(page.map((message) => message.seq)));
-  result.lastReadSeq = cursor;
-  if (preview) {
-    // No cursor, wake or status mutation: the page is not delivered yet.
-    result.peek = false;
-    return ok(result);
-  }
-  actor.lastReadSeq = cursor;
+  const delivered = new Set(page.map((message) => message.seq));
+  result.lastReadSeq = preview ? readCursor(draft, actor, delivered) : recordRead(draft, actor, delivered, now);
+  // The call itself proves the member is running. A later delivery receipt
+  // updates only the cursor; it must not reactivate a since-paused/stopped turn.
   if (actor.status === 'waiting' || actor.status === 'stopped') {
     actor.status = 'active';
     actor.waitSince = 0;
+    actor.updatedAtSeq = now;
   }
-  actor.updatedAtSeq = now;
-  const delivered = new Set(page.map((message) => message.seq));
-  draft.pendingWakes = draft.pendingWakes.filter(
-    (item) =>
-      item.sessionId !== actor.sessionId || (item.seq > cursor && !delivered.has(item.seq)),
-  );
   return ok(result);
 }
 
@@ -1646,6 +1639,17 @@ export function transition(board, actorSessionId, action) {
       const denied = requireActor({ allowPaused: true });
       if (denied) outcome = denied;
       else outcome = readBoard(draft, actor, action, now);
+      break;
+    }
+    case 'confirmRead': {
+      const denied = requireActor({ allowPaused: true });
+      if (denied) outcome = denied;
+      else if (!Array.isArray(action.seqs) || action.seqs.length > 200 ||
+        !action.seqs.every((s) => Number.isInteger(s) && s >= 1 && s <= draft.seq)) {
+        outcome = fail(ERRORS.INVALID_ARGUMENT, 'invalid delivered page sequences');
+      } else {
+        outcome = ok({ lastReadSeq: recordRead(draft, actor, new Set(action.seqs), now) });
+      }
       break;
     }
     case 'wait': {

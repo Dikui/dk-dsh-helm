@@ -272,9 +272,9 @@ export function registerSwarmTools(host) {
     {
       name: 'read_board',
       description:
-        'Read Swarm board messages since your cursor. A normal read advances your cursor and clears delivered wakes; peek=true only inspects. The result includes resolved targets. Pages are sized by the rendered JSON: when hasMore is true, continue with nextSince (normal reads) or nextSeqs (explicit seqs). A peek page never advances the cursor. A single legal post is always returned whole.',
+        'Read Swarm board messages since your cursor. A normal read advances your cursor and clears delivered wakes; peek=true only inspects. The result includes resolved targets. Pages are sized by the rendered JSON: when hasMore is true, repeat the same filters with since set to nextSince. A peek page never advances the cursor. A single legal post is always returned whole.',
       parameters: schema({
-        since: { type: 'integer', minimum: 0, description: 'First sequence to include (default: your cursor).' },
+        since: { type: 'integer', minimum: 0, description: 'Exclusive lower bound (default: your cursor, or zero for explicit seqs).' },
         limit: { type: 'integer', minimum: 1, maximum: 200, description: 'Max messages (default 100).' },
         seqs: { type: 'array', items: { type: 'integer' }, description: 'Read specific sequence numbers.' },
         channel: { type: 'string', description: 'Only this channel.' },
@@ -286,11 +286,10 @@ export function registerSwarmTools(host) {
         try {
           const entry = host.ensureMember(exec.agent);
           await host.activateRoot(host.state.rootAgent(entry.rootId));
-          // A real DSH call carries a token and can be observed at
-          // tools/result. Preview the page first; advance the cursor only when
-          // the final content the model saw matches this page exactly. Peek and
-          // token-less direct calls keep their legacy non-deferred semantics.
-          const preview = args.peek !== true && exec?.token !== undefined && exec?.token !== null;
+          const preview = args.peek !== true;
+          if (preview && exec.token == null) {
+            throw failure('MISSING_DELIVERY_TOKEN', 'Cannot confirm this read without a tool execution token.');
+          }
           const result = await host.read(entry.rootId, exec.agent.id, {
             ...args,
             ...(preview ? { preview: true } : {}),

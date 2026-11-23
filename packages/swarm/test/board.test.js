@@ -533,7 +533,7 @@ test('channel-filtered reads continue at the page tail', () => {
   assert.equal(second.result.hasMore, false);
 });
 
-test('explicit seqs continue with the remaining seqs instead of repeating', () => {
+test('explicit seqs continue from the last delivered seq without growing the result', () => {
   let board = addWorker(seedBoard()).state;
   for (const prefix of ['a', 'b', 'c']) {
     board = transition(board, COORD, { type: 'post', text: prefix.repeat(6000) }).state;
@@ -541,14 +541,14 @@ test('explicit seqs continue with the remaining seqs instead of repeating', () =
   const first = transition(board, WORKER, { type: 'read', seqs: [1, 2, 3] });
   assert.deepEqual(first.result.messages.map((m) => m.seq), [1]);
   assert.equal(first.result.hasMore, true);
-  assert.deepEqual(first.result.nextSeqs, [2, 3]);
+  assert.equal(first.result.nextSince, 1);
   assert.equal(first.result.lastReadSeq, 1, 'seq 1 was delivered, so the cursor reaches it');
   const second = transition(first.state, WORKER, {
     type: 'read',
-    seqs: first.result.nextSeqs,
+    seqs: [1, 2, 3], since: first.result.nextSince,
   });
   assert.deepEqual(second.result.messages.map((m) => m.seq), [2]);
-  assert.deepEqual(second.result.nextSeqs, [3]);
+  assert.equal(second.result.nextSince, 2);
 });
 
 test('read hides channels the member cannot see', () => {
@@ -1177,7 +1177,7 @@ test('read keeps hasMore scoped to the same explicit-seq query', () => {
   assert.deepEqual(jumped.result.messages.map((message) => message.seq), [3]);
   assert.equal(jumped.result.lastReadSeq, 0, 'a jumped seq cannot skip unread seq 1');
   assert.equal(jumped.result.hasMore, false, 'the explicit seq query has no continuation');
-  assert.equal(jumped.result.nextSeqs, undefined);
+  assert.equal(jumped.result.nextSince, undefined);
   assertFailure(
     transition(board, WORKER, { type: 'read', channel: 'missing' }),
     ERRORS.UNKNOWN_CHANNEL,

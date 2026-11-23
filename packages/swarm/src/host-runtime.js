@@ -929,7 +929,7 @@ export class SwarmHost {
     // recomputes the continuous cursor at commit time, so a missing page can
     // never be jumped over.
     const out = await this.state.act(record.rootId, record.agentId, {
-      type: 'read',
+      type: 'confirmRead',
       seqs: record.seqs,
     });
     if (!out.result?.ok) {
@@ -957,6 +957,7 @@ export class SwarmHost {
   }
 
   async wait(rootId, agentId, options = {}) {
+    await this.awaitReadCommit(agentId);
     const out = await this.state.act(rootId, agentId, {
       type: 'wait',
       ...(options.since !== undefined ? { since: options.since } : {}),

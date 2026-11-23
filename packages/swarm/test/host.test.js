@@ -459,10 +459,9 @@ test('registers four gated tools and shows social tools only after a worker join
   const board = rt.state.board('root');
   const alice = Object.values(board.members).find((member) => member.name === 'alice');
   rt.agents.set(alice.sessionId, fakeAgent(alice.sessionId));
-  const read = await byName.read_board.definition.execute(
-    {},
-    { agent: rt.agents.get(alice.sessionId), signal: new AbortController().signal },
-  );
+  const readExec = { name: 'read_board', agent: rt.agents.get(alice.sessionId), token: Symbol('read') };
+  const read = await byName.read_board.definition.execute({}, readExec);
+  rt.host.observeToolResult(readExec, { isError: false, content: byName.read_board.definition.output.render({}, read) });
   assert.equal(read.ok, true);
   assert.ok(Array.isArray(read.messages));
 
@@ -490,8 +489,11 @@ test('read_board paginates by the rendered JSON and returns an oversized escaped
   const tool = rt.tools.find((entry) => entry.definition.name === 'read_board').definition;
   const agent = rt.agents.get(alice.sessionId);
   const read = async () => {
-    const value = await tool.execute({}, { agent, signal: new AbortController().signal });
-    const text = tool.output.render({}, value)[0].text;
+    const exec = { agent, name: 'read_board', token: Symbol('page') };
+    const value = await tool.execute({}, exec);
+    const content = tool.output.render({}, value);
+    rt.host.observeToolResult(exec, { isError: false, content });
+    const text = content[0].text;
     return { value, text, page: JSON.parse(text) };
   };
 
@@ -546,6 +548,9 @@ test('read_board commits only the confirmed page and repeats it after a blocked 
   await rt.host.post('root', 'root', first);
   await rt.host.post('root', 'root', second);
 
+  const untracked = await read(undefined);
+  assert.equal(untracked.value.ok, false, 'a read without a delivery token must fail closed');
+  assert.equal(cursor(), 0);
   const blocked = await read('blocked');
   assert.deepEqual(blocked.value.messages.map((message) => message.seq), [1]);
   assert.equal(cursor(), 0, 'a preview does not move the cursor');
@@ -602,6 +607,25 @@ test('read_board commits only the confirmed page and repeats it after a blocked 
   assert.equal(cursor(), 2, 'a peek result never advances the cursor');
 });
 
+test('the read receipt confirms the original page without rendering a second explicit-seq page', async (t) => {
+  const rt = await setup();
+  t.after(() => rt.host.close());
+  const alice = await addAlice(rt);
+  registerSwarmTools(rt.host);
+  const tool = rt.tools.find((entry) => entry.definition.name === 'read_board').definition;
+  const agent = rt.agents.get(alice.sessionId);
+  // Two posts just below the normal page budget. A larger receipt envelope
+  // used to re-paginate the page and acknowledge only the first post.
+  await rt.host.post('root', 'root', 'a'.repeat(4052));
+  await rt.host.post('root', 'root', 'b'.repeat(4052));
+  const exec = { name: 'read_board', agent, token: Symbol('two posts') };
+  const value = await tool.execute({}, exec);
+  assert.deepEqual(value.messages.map((m) => m.seq), [1, 2]);
+  rt.host.observeToolResult(exec, { isError: false, content: tool.output.render({}, value) });
+  await rt.host.awaitReadCommit(alice.sessionId);
+  assert.equal(rt.state.member('root', alice.sessionId).lastReadSeq, 2);
+});
+
 test('read_board leaves the cursor untouched when committing the delivered page fails', async (t) => {
   const rt = await setup();
   t.after(() => rt.host.close());
@@ -614,7 +638,7 @@ test('read_board leaves the cursor untouched when committing the delivered page 
   const originalAct = rt.state.act.bind(rt.state);
   let rejected = false;
   rt.state.act = async (rootId, actorId, action) => {
-    if (!rejected && action.type === 'read' && action.preview !== true) {
+    if (!rejected && action.type === 'confirmRead') {
       rejected = true;
       throw new Error('disk full');
     }

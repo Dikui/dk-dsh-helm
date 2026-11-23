@@ -159,9 +159,25 @@ test('installed runtime: /swarm command, four-tool gating, wake delivery and dur
     assert.equal(reopened.seq, replySeq);
     assert.equal(reopened.messages.at(-1).text, '@lead result ready');
     assert.equal(reopened.members.find(member => member.name === 'worker-1').lastSeq, retried);
+    // A native post-execute policy may withhold the page even though the tool
+    // body succeeded. Neither refusal nor a successful rewrite counts as read.
+    for (const kind of ['block', 'accept']) {
+      const withheld = [{ type: 'text', text: 'Board page withheld by policy' }];
+      const off = runtimeCtx.ctx.on('tools/post-execute', (exec, _result, next) =>
+        exec.name !== 'read_board' ? next() : kind === 'block'
+          ? { kind, feedback: withheld } : { kind, content: withheld });
+      try {
+        const altered = await invoke(root, 'read_board', {});
+        assert.equal(altered.isError, kind === 'block');
+        assert.match(altered.content[0].text, /withheld by policy/);
+        const snapshot = JSON.parse((await command(root, '/swarm view')).text);
+        assert.equal(snapshot.members.find(member => member.name === 'lead').lastSeq, kickoff);
+      } finally { off(); }
+    }
     const read = (await invoke(root, 'read_board', {})).value;
     assert.deepEqual(read.messages.map(message => message.seq), [failedSeq, retried, replySeq]);
     assert.equal(read.lastReadSeq, replySeq);
+    assert.deepEqual((await invoke(root, 'read_board', {})).value.messages, []);
   } finally {
     if (runtimeCtx) await runtimeCtx.close().catch(() => {});
     if (path.dirname(temp) !== path.resolve(tmpdir()) || !path.basename(temp).startsWith('dk-swarm-host-')) throw Error('unexpected temporary root');
