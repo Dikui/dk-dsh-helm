@@ -72,32 +72,105 @@ function assertNotAborted(signal, phase) {
   }
 }
 
-/**
- * Keep a locked verdict attached to the failure that ended the run, including
- * failures after the report was delivered. The error object itself (including
- * AbortError identity) is preserved; only the retained verdict is added when
- * the object can carry it.
- */
-function retainLockedVerdict(error, state) {
-  if (!state.locked) {
-    return error;
+// Marks an error object that already carries one run's sealed verdict. It is
+// not a cross-run store: a reused error is wrapped instead of overwritten.
+const retainedVerdictMarker = Symbol('boost.lockedVerdict');
+
+function lockedVerdictFields(state) {
+  return {
+    initialVerdict: { value: state.initialVerdict, configurable: true },
+    deliveryFailure: {
+      value: state.delivered ? null : (state.deliveryFailure ?? 'not-observed'),
+      configurable: true,
+    },
+    deliveryConfirmed: { value: state.delivered === true, configurable: true },
+    [retainedVerdictMarker]: { value: true, configurable: true },
+  };
+}
+
+function isObjectLike(value) {
+  return (typeof value === 'object' && value !== null) || typeof value === 'function';
+}
+
+function isCancellation(error, signal) {
+  if (signal && signal.aborted === true) {
+    return true;
   }
   try {
-    if ((typeof error === 'object' && error !== null) || typeof error === 'function') {
-      Object.defineProperties(error, {
-        initialVerdict: { value: state.initialVerdict, configurable: true },
-        deliveryFailure: {
-          value: state.delivered ? null : (state.deliveryFailure ?? 'not-observed'),
-          configurable: true,
-        },
-        deliveryConfirmed: { value: state.delivered === true, configurable: true },
-      });
+    return isObjectLike(error) && error.name === 'AbortError';
+  } catch {
+    return false;
+  }
+}
+
+function canCarryLockedVerdict(error) {
+  if (!isObjectLike(error)) {
+    return false;
+  }
+  try {
+    if (Object.prototype.hasOwnProperty.call(error, retainedVerdictMarker)) {
+      return false;
+    }
+    // A verdict already on the object belongs to an earlier run or the
+    // caller; this run must not overwrite it.
+    return !Object.prototype.hasOwnProperty.call(error, 'initialVerdict');
+  } catch {
+    return false;
+  }
+}
+
+function failureMessage(error) {
+  try {
+    if (isObjectLike(error) && typeof error.message === 'string' && error.message !== '') {
+      return error.message;
+    }
+    return String(error);
+  } catch {
+    return 'Boost run failed after the initial verdict was locked';
+  }
+}
+
+function wrapLockedVerdict(error, state) {
+  const wrapped = new Error(failureMessage(error), { cause: error });
+  try {
+    if (isObjectLike(error) && typeof error.name === 'string' && error.name !== '') {
+      wrapped.name = error.name;
     }
   } catch {
-    // A frozen or exotic rejection value cannot carry the note; never replace
-    // it, so cancellation and other rejection semantics stay intact.
+    // Keep the default Error name when the rejection's name is unreadable.
   }
-  return error;
+  try {
+    if (isObjectLike(error) && error.code !== undefined) {
+      wrapped.code = error.code;
+    }
+  } catch {
+    // Keep no code when the rejection's code is unreadable.
+  }
+  Object.defineProperties(wrapped, lockedVerdictFields(state));
+  return wrapped;
+}
+
+/**
+ * Keep a locked verdict attached to the failure that ended the run, including
+ * failures after the report was delivered. A fresh, extensible rejection keeps
+ * its identity. A frozen, primitive, or reused rejection gets a per-run Error
+ * wrapper (original cause, message, name, and code) so one run's verdict can
+ * never overwrite another's. Cancellation keeps the existing AbortError
+ * semantics and is never wrapped.
+ */
+function retainLockedVerdict(error, state, signal) {
+  if (!state.locked || isCancellation(error, signal)) {
+    return error;
+  }
+  if (canCarryLockedVerdict(error)) {
+    try {
+      Object.defineProperties(error, lockedVerdictFields(state));
+      return error;
+    } catch {
+      // Frozen, sealed, or exotic: fall through to a per-run wrapper.
+    }
+  }
+  return wrapLockedVerdict(error, state);
 }
 
 async function runPhase(phase, signal, operation) {
@@ -380,10 +453,6 @@ export async function runBoost(options = {}) {
           'final model-facing boost_reveal content (the execution pipeline or a post-execute policy ' +
           'blocked or replaced it). The comparison is not complete; the locked initial verdict is preserved ' +
           `(delivery: ${state.deliveryFailure ?? 'not-observed'}).`,
-        {
-          initialVerdict: state.initialVerdict,
-          deliveryFailure: state.deliveryFailure ?? 'not-observed',
-        },
       );
     }
 
@@ -400,7 +469,7 @@ export async function runBoost(options = {}) {
       finalVerdict,
     };
   } catch (error) {
-    throw retainLockedVerdict(error, state);
+    throw retainLockedVerdict(error, state, signal);
   } finally {
     state.closed = true;
     if (signal) {

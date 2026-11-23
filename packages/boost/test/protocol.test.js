@@ -282,6 +282,58 @@ test('a reviewer failure after a delivered reveal still carries the locked initi
   );
 });
 
+// Regression: rejection values that cannot safely carry this run's verdict
+// (frozen or primitive) must get a per-run wrapper instead of losing it; a
+// reused Error must not let a later run overwrite the earlier run's verdict.
+test('frozen, primitive, and reused rejections get a per-run locked-verdict wrapper', async () => {
+  const runWith = async (thrown, verdict) => {
+    try {
+      await runBoost({
+        task: TASK,
+        runWorker: async () => WORKER_REPORT,
+        getEvidence: async () => EVIDENCE,
+        runReviewer: async (prompt, reveal) => {
+          reveal(verdict, { deferDelivery: true });
+          throw thrown;
+        },
+      });
+    } catch (error) {
+      return error;
+    }
+    assert.fail('expected runBoost to reject');
+  };
+
+  const frozen = new Error('frozen reviewer failure');
+  frozen.name = 'ReviewerFailure';
+  frozen.code = 'E_FROZEN';
+  Object.freeze(frozen);
+  const frozenFailure = await runWith(frozen, 'locked before frozen');
+  assert.notEqual(frozenFailure, frozen);
+  assert.equal(frozenFailure.cause, frozen);
+  assert.equal(frozenFailure.message, 'frozen reviewer failure');
+  assert.equal(frozenFailure.name, 'ReviewerFailure');
+  assert.equal(frozenFailure.code, 'E_FROZEN');
+  assert.equal(frozenFailure.initialVerdict, 'locked before frozen');
+  assert.equal(frozenFailure.deliveryFailure, 'not-observed');
+  assert.equal(frozenFailure.deliveryConfirmed, false);
+
+  const primitiveFailure = await runWith('primitive reviewer failure', 'locked before primitive');
+  assert.ok(primitiveFailure instanceof Error);
+  assert.equal(primitiveFailure.cause, 'primitive reviewer failure');
+  assert.equal(primitiveFailure.message, 'primitive reviewer failure');
+  assert.equal(primitiveFailure.initialVerdict, 'locked before primitive');
+
+  const shared = new Error('shared reviewer failure');
+  const first = await runWith(shared, 'first shared verdict');
+  assert.equal(first, shared);
+  assert.equal(shared.initialVerdict, 'first shared verdict');
+  const second = await runWith(shared, 'second shared verdict');
+  assert.notEqual(second, shared);
+  assert.equal(second.cause, shared);
+  assert.equal(second.initialVerdict, 'second shared verdict');
+  assert.equal(shared.initialVerdict, 'first shared verdict');
+});
+
 test('a final reviewer report without reveal fails closed', async () => {
   await assert.rejects(
     runBoost({
