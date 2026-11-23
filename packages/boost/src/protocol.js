@@ -3,10 +3,13 @@
  *
  * One run is: initial doer -> selected evidence -> one fresh reviewer. The
  * reviewer's first packet contains the task and evidence, never the worker
- * report. The reviewer must synchronously call reveal(initialVerdictText) once
- * (hosted as the boost_reveal tool with the initialVerdict parameter) to lock
- * a non-empty, bounded initial verdict; reveal returns the worker report. A
- * final verdict produced without a successful reveal is rejected.
+ * report. The reviewer must call reveal(initialVerdictText) once (hosted as the
+ * boost_reveal tool with the initialVerdict parameter) to lock a non-empty,
+ * bounded initial verdict; reveal returns the worker report. Locking is not
+ * delivery: the DSH execution pipeline can still block or replace the tool
+ * result after the body returns. When the caller defers delivery, the run is
+ * accepted only after confirmDelivery() observes the exact final model-facing
+ * content. A final verdict produced without a delivered reveal is rejected.
  *
  * Every LIMITS entry is an inclusive maximum JavaScript string length. Empty
  * (except evidence), oversized, or non-string values fail closed. The protocol
@@ -162,15 +165,25 @@ function buildReviewerPrompt({ task, evidence }) {
   ].join('\n');
 }
 
+/** Whether model-facing content is exactly the worker report and nothing else. */
+function isExactReportDelivery(content, workerReport) {
+  return Array.isArray(content)
+    && content.length === 1
+    && content[0] !== null
+    && typeof content[0] === 'object'
+    && content[0].type === 'text'
+    && content[0].text === workerReport;
+}
+
 function createReveal(state) {
-  return function reveal(initialVerdictText) {
+  function reveal(initialVerdictText, options) {
     if (state.closed) {
       fail(
         'REVEAL_AFTER_END',
         'boost_reveal is only available before the run ends; late calls are rejected.',
       );
     }
-    if (state.revealed) {
+    if (state.locked) {
       fail(
         'INITIAL_VERDICT_ALREADY_REVEALED',
         'boost_reveal accepts exactly one initial verdict; the first accepted verdict is locked.',
@@ -183,10 +196,50 @@ function createReveal(state) {
       label: 'initial verdict',
       limit: LIMITS.initialVerdictChars,
     });
-    state.revealed = true;
+    state.locked = true;
 
+    if (options !== null && typeof options === 'object' && options.deferDelivery === true) {
+      // The tool body locked the verdict, but the model has not accepted the
+      // report yet: DSH post-execute policy can still block or replace it.
+      return state.workerReport;
+    }
+
+    // Direct protocol callers have no policy layer between this return value
+    // and the reviewer; the synchronous return is the delivery.
+    state.delivered = true;
+    state.deliveryObserved = true;
     return state.workerReport;
+  }
+
+  /**
+   * Record the one authoritative delivery observation for the locked verdict.
+   * Only the final model-facing content counts; a canonical value or a
+   * success flag alone is not delivery. The first observation is sealed.
+   */
+  reveal.confirmDelivery = function confirmDelivery(observation) {
+    if (!state.locked || state.closed || state.deliveryObserved) {
+      return false;
+    }
+    state.deliveryObserved = true;
+
+    if (
+      observation === null
+      || typeof observation !== 'object'
+      || observation.isError !== false
+    ) {
+      state.deliveryFailure = 'error-result';
+      return false;
+    }
+    if (!isExactReportDelivery(observation.content, state.workerReport)) {
+      state.deliveryFailure = 'content-mismatch';
+      return false;
+    }
+
+    state.delivered = true;
+    return true;
   };
+
+  return reveal;
 }
 
 /**
@@ -197,7 +250,7 @@ function createReveal(state) {
  * @param {AbortSignal} [options.signal]
  * @param {(prompt: string) => Promise<string>} options.runWorker
  * @param {() => Promise<string>} options.getEvidence
- * @param {(prompt: string, reveal: (initialVerdictText: string) => string) => Promise<string>} options.runReviewer
+ * @param {(prompt: string, reveal: (initialVerdictText: string, options?: { deferDelivery?: boolean }) => string) => Promise<string>} options.runReviewer
  * @returns {Promise<{ workerReport: string, initialVerdict: string, finalVerdict: string }>}
  */
 export async function runBoost(options = {}) {
@@ -254,7 +307,15 @@ export async function runBoost(options = {}) {
     allowEmpty: true,
   });
 
-  const state = { workerReport, initialVerdict: null, revealed: false, closed: false };
+  const state = {
+    workerReport,
+    initialVerdict: null,
+    locked: false,
+    delivered: false,
+    deliveryObserved: false,
+    deliveryFailure: null,
+    closed: false,
+  };
   const onAbort = () => {
     state.closed = true;
   };
@@ -273,10 +334,24 @@ export async function runBoost(options = {}) {
     );
     assertNotAborted(signal, 'finish');
 
-    if (!state.revealed) {
+    if (!state.locked) {
       fail(
         'MISSING_INITIAL_VERDICT',
         'The reviewer returned a final report before a successful boost_reveal; rejected.',
+      );
+    }
+
+    if (!state.delivered) {
+      fail(
+        'REVEAL_NOT_DELIVERED',
+        'The reviewer locked its initial verdict, but the worker report was not delivered as the ' +
+          'final model-facing boost_reveal content (the execution pipeline or a post-execute policy ' +
+          'blocked or replaced it). The comparison is not complete; the locked initial verdict is preserved ' +
+          `(delivery: ${state.deliveryFailure ?? 'not-observed'}).`,
+        {
+          initialVerdict: state.initialVerdict,
+          deliveryFailure: state.deliveryFailure ?? 'not-observed',
+        },
       );
     }
 

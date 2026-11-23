@@ -8,9 +8,16 @@
  * instance, and the tool looks the callback up by the calling agent id — never by
  * a model-supplied id. The callback itself owns one-shot and closed-run policy,
  * so a successful call is deliberately not removed here.
+ *
+ * Locking the verdict and delivering the report are distinct. When the tool
+ * runs, the callback defers delivery and this module records the execution token
+ * of that exact call. The reviewer preset observes `tools/result` and routes
+ * the final model-facing result back here; only that event, for that token and
+ * caller, confirms delivery. Late, foreign, or duplicate events cannot.
  */
 
 const armedReveals = new Map()
+const pendingDeliveries = new Map()
 
 /** Error raised by the reveal boundary, carrying a stable `code` for callers. */
 export class BoostRevealError extends Error {
@@ -41,8 +48,8 @@ function requireId(value, label) {
 /**
  * Arm one reviewer child with the reveal callback created by the Boost protocol.
  * @param {string} childId - child id reserved by `startActivation`.
- * @param {(initialVerdict: string) => string} revealFn - protocol-owned reveal callback.
- * @returns {() => void} idempotent disposer; it removes only this exact callback.
+ * @param {(initialVerdict: string, options?: { deferDelivery?: boolean }) => string} revealFn - protocol-owned reveal callback.
+ * @returns {() => void} idempotent disposer; it removes only this exact callback and its pending deliveries.
  */
 export function armReveal(childId, revealFn) {
   const key = requireId(childId, 'armReveal() childId')
@@ -53,13 +60,16 @@ export function armReveal(childId, revealFn) {
     throw new BoostRevealError('REVEAL_ALREADY_ARMED', `a reveal callback is already armed for child "${key}"`)
   }
 
-  armedReveals.set(key, revealFn)
+  const entry = { revealFn, tokens: new Set() }
+  armedReveals.set(key, entry)
   let disposed = false
 
   return function dispose() {
     if (disposed) return
     disposed = true
-    if (armedReveals.get(key) === revealFn) armedReveals.delete(key)
+    if (armedReveals.get(key) === entry) armedReveals.delete(key)
+    for (const token of entry.tokens) pendingDeliveries.delete(token)
+    entry.tokens.clear()
   }
 }
 
@@ -67,12 +77,14 @@ export function armReveal(childId, revealFn) {
  * Invoke the reveal callback armed for exactly this calling agent.
  * @param {string} agentId - `exec.agent.id` of the calling reviewer.
  * @param {string} initialVerdict - non-empty verdict text from the model.
+ * @param {{ name?: string, agent?: { id?: string }, token?: unknown }} [execution] -
+ *   the tool execution context when called from the real pipeline.
  * @returns {string} the predecessor worker report returned by the protocol.
  */
-export function revealPredecessor(agentId, initialVerdict) {
+export function revealPredecessor(agentId, initialVerdict, execution) {
   const key = requireId(agentId, 'boost_reveal caller agent id')
-  const revealFn = armedReveals.get(key)
-  if (revealFn === undefined) {
+  const entry = armedReveals.get(key)
+  if (entry === undefined) {
     throw new BoostRevealError(
       'REVEAL_NOT_ARMED',
       `boost_reveal is not armed for agent "${key}"; only the reviewer child armed by /boost may call it`,
@@ -82,9 +94,64 @@ export function revealPredecessor(agentId, initialVerdict) {
     throw new BoostRevealError('EMPTY_INITIAL_VERDICT', 'boost_reveal requires a non-empty initialVerdict')
   }
 
-  const report = revealFn(initialVerdict)
+  const token = execution !== null && typeof execution === 'object' ? execution.token : undefined
+  if (token === undefined) {
+    const report = entry.revealFn(initialVerdict)
+    if (typeof report !== 'string') {
+      throw new BoostRevealError('INVALID_REVEAL_RESULT', 'the armed reveal callback did not return a predecessor report string')
+    }
+    return report
+  }
+
+  if (execution.name !== 'boost_reveal' || execution.agent?.id !== key) {
+    throw new BoostRevealError(
+      'INVALID_REVEAL_EXECUTION',
+      'boost_reveal delivery requires the execution context of this exact calling agent',
+    )
+  }
+  if (pendingDeliveries.has(token)) {
+    throw new BoostRevealError(
+      'REVEAL_ALREADY_RECORDED',
+      'this boost_reveal execution already has a pending delivery observation',
+    )
+  }
+
+  const report = entry.revealFn(initialVerdict, { deferDelivery: true })
   if (typeof report !== 'string') {
     throw new BoostRevealError('INVALID_REVEAL_RESULT', 'the armed reveal callback did not return a predecessor report string')
   }
+  pendingDeliveries.set(token, { agentId: key, entry })
+  entry.tokens.add(token)
   return report
+}
+
+/**
+ * Observe the final model-facing result of one tool execution and confirm
+ * delivery only for the pending boost_reveal call it belongs to.
+ * Never throws: an unrelated or malformed event is simply not a receipt.
+ * @param {{ name?: string, agent?: { id?: string }, token?: unknown }} exec - execution context from `tools/result`.
+ * @param {{ isError?: boolean, content?: unknown }} result - final frozen tool result.
+ * @returns {boolean} whether this observation confirmed the locked verdict's delivery.
+ */
+export function observeRevealResult(exec, result) {
+  const token = exec !== null && typeof exec === 'object' ? exec.token : undefined
+  if (token === undefined) return false
+  const pending = pendingDeliveries.get(token)
+  if (pending === undefined) return false
+  if (exec.name !== 'boost_reveal' || exec.agent?.id !== pending.agentId) return false
+
+  pendingDeliveries.delete(token)
+  pending.entry.tokens.delete(token)
+  const confirmDelivery = pending.entry.revealFn.confirmDelivery
+  if (typeof confirmDelivery !== 'function') return false
+  try {
+    return confirmDelivery({
+      agentId: pending.agentId,
+      token,
+      isError: result !== null && typeof result === 'object' && result.isError === true,
+      content: result?.content,
+    }) === true
+  } catch {
+    return false
+  }
 }

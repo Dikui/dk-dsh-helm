@@ -122,6 +122,107 @@ test('reviewer prompt keeps the first pass independent and compares only after b
   assert.match(finalSection, /agreement and disagreement/i);
 });
 
+// Regression: boost_reveal locks the verdict in the tool body, but DSH
+// post-execute policy can still block or replace the final model-facing content.
+test('a deferred reveal only counts after the exact model-facing report content is delivered', async () => {
+  let revealed;
+  const result = await runBoost({
+    task: TASK,
+    runWorker: async () => WORKER_REPORT,
+    getEvidence: async () => EVIDENCE,
+    runReviewer: async (prompt, reveal) => {
+      revealed = reveal;
+      assert.equal(reveal('locked before the policy layer', { deferDelivery: true }), WORKER_REPORT);
+      assert.equal(
+        reveal.confirmDelivery({ isError: false, content: [{ type: 'text', text: WORKER_REPORT }] }),
+        true,
+      );
+      return FINAL_VERDICT;
+    },
+  });
+
+  assert.equal(result.initialVerdict, 'locked before the policy layer');
+  assert.equal(result.finalVerdict, FINAL_VERDICT);
+  assert.equal(
+    revealed.confirmDelivery({ isError: false, content: [{ type: 'text', text: WORKER_REPORT }] }),
+    false,
+  );
+});
+
+test('a blocked or replaced reveal result is not delivery, and the run keeps the locked initial verdict', async () => {
+  const cases = [
+    {
+      name: 'post-execute block',
+      observation: { isError: true, content: [{ type: 'text', text: 'blocked by policy' }] },
+      failure: 'error-result',
+    },
+    {
+      name: 'accept with replacement text (isError=false)',
+      observation: { isError: false, content: [{ type: 'text', text: 'policy summary instead of the report' }] },
+      failure: 'content-mismatch',
+    },
+    {
+      name: 'accept with the report plus extra content',
+      observation: {
+        isError: false,
+        content: [{ type: 'text', text: WORKER_REPORT }, { type: 'text', text: 'appended by policy' }],
+      },
+      failure: 'content-mismatch',
+    },
+  ];
+
+  for (const { name, observation, failure } of cases) {
+    let lateReveal;
+    await assert.rejects(
+      runBoost({
+        task: TASK,
+        runWorker: async () => WORKER_REPORT,
+        getEvidence: async () => EVIDENCE,
+        runReviewer: async (prompt, reveal) => {
+          lateReveal = reveal;
+          reveal('locked before the policy layer', { deferDelivery: true });
+          assert.equal(reveal.confirmDelivery(observation), false, name);
+          return FINAL_VERDICT;
+        },
+      }),
+      (error) => {
+        assert.equal(error.code, 'REVEAL_NOT_DELIVERED', name);
+        assert.equal(error.initialVerdict, 'locked before the policy layer', name);
+        assert.equal(error.deliveryFailure, failure, name);
+        assert.match(error.message, /not delivered/i, name);
+        return true;
+      },
+    );
+
+    assert.equal(
+      lateReveal.confirmDelivery({ isError: false, content: [{ type: 'text', text: WORKER_REPORT }] }),
+      false,
+      `${name}: a late confirmation must not become a receipt`,
+    );
+  }
+});
+
+test('a deferred reveal with no observed delivery fails without reporting a comparison', async () => {
+  await assert.rejects(
+    runBoost({
+      task: TASK,
+      runWorker: async () => WORKER_REPORT,
+      getEvidence: async () => EVIDENCE,
+      runReviewer: async (prompt, reveal) => {
+        reveal('locked but never observed', { deferDelivery: true });
+        return FINAL_VERDICT;
+      },
+    }),
+    (error) => {
+      assert.equal(error.code, 'REVEAL_NOT_DELIVERED');
+      assert.equal(error.initialVerdict, 'locked but never observed');
+      assert.equal(error.deliveryFailure, 'not-observed');
+      assert.doesNotMatch(error.message, /comparison (is )?complete/i);
+      return true;
+    },
+  );
+});
+
 test('a final reviewer report without reveal fails closed', async () => {
   await assert.rejects(
     runBoost({

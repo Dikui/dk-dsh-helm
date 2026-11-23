@@ -1,6 +1,9 @@
 // Optional installed-runtime check. No profile, browser, credentials or remote model.
-// Load the shipped Cordis services, register the actual command/roles, drive two
+// Load the shipped Cordis services, register the actual command/roles, drive
 // scripted activations and dispatch their tool calls through the native executor.
+// Regression coverage: a post-execute policy that blocks or replaces boost_reveal's
+// final content must fail the run, preserve the locked verdict, and never print
+// "Final comparison", while the no-policy run keeps working unchanged.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
@@ -25,7 +28,7 @@ test('installed DSH runtime: command → worker → failing boundary check → b
   const logs = [], parent = {id:'root',session:{append(...args){logs.push(args);}}};
   const roles = {worker:{},reviewer:{}};
   const marker = 'impl-report: all boundary cases covered';
-  const events = []; let mode = 'negative';
+  const events = []; let mode = 'negative'; let postExecute = 'pass';
   const signal = new AbortController().signal;
   function invoke(agent, name, args) {
     return ctx.tools.execute({agent, signal, calls:[{type:'tool-call',id:'test',name,arguments:JSON.stringify(args)}]})
@@ -45,6 +48,17 @@ test('installed DSH runtime: command → worker → failing boundary check → b
       assert.equal((await invoke(agent,'read',{})).isError, true, 'no reviewer fs access');
       if (mode === 'no-reveal') return 'unsupported final answer';
       const res = await invoke(agent,'boost_reveal',{initialVerdict:'Boundary fails at -1.'});
+      if (postExecute === 'block') {
+        assert.equal(res.isError, true, JSON.stringify(res));
+        assert.match(res.content[0].text, /blocked by post-execute policy/);
+        return 'The report was blocked; I cannot compare.';
+      }
+      if (postExecute === 'replace') {
+        assert.equal(res.isError, false, JSON.stringify(res));
+        assert.equal(res.value, marker, 'canonical value survives content replacement');
+        assert.equal(res.content[0].text, 'policy summary instead of the worker report');
+        return 'The report was replaced; I cannot compare.';
+      }
       assert.equal(res.value, marker, JSON.stringify(res));
       assert.equal((await invoke(agent,'boost_reveal',{initialVerdict:'overwrite'})).isError, true);
       return 'Disagree: the real negative boundary test failed.';
@@ -72,9 +86,16 @@ test('installed DSH runtime: command → worker → failing boundary check → b
     addTool('read',{type:'string'},async args=>{
       assert.equal(args.file_path,path.resolve(repo,'fixtures/boundary.mjs'));return readFile(args.file_path,'utf8');
     });
+    const scopeByRole = {};
     for(const [role,key] of Object.entries(roles)) {
-      const s=createScope(ctx,key);scopes.push(s);fibers.push(s.ctx.plugin(policy,{role}));
+      const s=createScope(ctx,key);scopes.push(s);scopeByRole[role]=s;fibers.push(s.ctx.plugin(policy,{role}));
     }
+    scopeByRole.reviewer.ctx.on('tools/post-execute', async (exec, result, next) => {
+      if (exec.name !== 'boost_reveal' || postExecute === 'pass') return next();
+      if (postExecute === 'block') return {kind:'block',feedback:[{type:'text',text:'blocked by post-execute policy'}]};
+      if (postExecute === 'replace') return {kind:'accept',content:[{type:'text',text:'policy summary instead of the worker report'}]};
+      return next();
+    });
     fibers.push(ctx.plugin(plugin)); await tick();
     assert.deepEqual(ctx.tools.schemas(roles.reviewer).map(x=>x.name),['boost_reveal']);
     const help = await ctx.commands.execute(parent,'/boost help',[],signal);
@@ -84,9 +105,32 @@ test('installed DSH runtime: command → worker → failing boundary check → b
     const result=await run();assert.deepEqual(events,['worker','check','reviewer'],result.text);
     assert.equal(result.kind,'error',result.text); assert.match(result.text,/exit 1/);assert.match(result.text,/Boundary fails at -1/);
     assert.match(result.text,/clamp\(-1, 9\) must be zero/);assert.match(result.text,/Disagree/);
-    assert.match(result.text,/impl-report:/);
+    assert.match(result.text,/impl-report:/);assert.match(result.text,/Final comparison/);
+    events.length=0;
     mode='no-reveal';assert.match((await run()).text,/before a successful boost_reveal/);
-    assert.deepEqual(logs.map(x=>x[0]), ['command/run','command/done','command/run','command/done']);
+    mode='negative';
+
+    const incomplete = (outcome, deliveryFailure) => {
+      assert.equal(outcome.kind,'error',outcome.text);
+      assert.match(outcome.text, /worker report was not delivered/);
+      assert.match(outcome.text, deliveryFailure);
+      assert.match(outcome.text, /Initial verdict \(locked; delivery of the worker report was not confirmed\)/);
+      assert.match(outcome.text, /Boundary fails at -1/);
+      assert.match(outcome.text, /comparison is incomplete/i);
+      assert.doesNotMatch(outcome.text, /Final comparison/);
+      assert.doesNotMatch(outcome.text, /impl-report:/);
+    };
+
+    events.length=0; postExecute='block';
+    incomplete(await run(), /\(delivery: error-result\)/);
+    assert.deepEqual(events,['worker','check','reviewer']);
+
+    events.length=0; postExecute='replace';
+    incomplete(await run(), /\(delivery: content-mismatch\)/);
+    assert.deepEqual(events,['worker','check','reviewer']);
+    postExecute='pass';
+
+    assert.deepEqual(logs.map(x=>x[0]), ['command/run','command/done','command/run','command/done','command/run','command/done','command/run','command/done']);
   } finally {
     for(const f of fibers.reverse()) await f.dispose();
     for(const s of scopes) await s.dispose();

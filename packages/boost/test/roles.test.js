@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 
-import { armReveal, revealPredecessor, BoostRevealError } from '../src/reveal.js'
+import { armReveal, revealPredecessor, observeRevealResult, BoostRevealError } from '../src/reveal.js'
 import { apply, WORKER_ALLOWED_TOOLS, REVIEWER_ALLOWED_TOOLS } from '../src/policy.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -14,6 +14,16 @@ let sequence = 0
 function agentKey(label) {
   sequence += 1
   return `boost-test-${label}-${sequence}`
+}
+
+function policyContext(service, events = []) {
+  return {
+    tools: service,
+    on(name, handler) {
+      events.push({ name, handler })
+      return () => {}
+    },
+  }
 }
 
 function toolsService(globals = [], overrides = {}) {
@@ -39,9 +49,9 @@ function toolsService(globals = [], overrides = {}) {
   return { service, calls }
 }
 
-function applyWith(role, globals, overrides) {
+function applyWith(role, globals, overrides, events = []) {
   const { service, calls } = toolsService(globals, overrides)
-  apply({ tools: service }, { role })
+  apply(policyContext(service, events), { role })
   return calls
 }
 
@@ -126,9 +136,100 @@ test('reveal: keeps the callback armed after a successful reveal', () => {
   dispose()
 })
 
-test('policy worker: denies every non-allowlisted global and guards the allowlist', () => {
-  const calls = applyWith('worker', ['run_code', 'some_global', 'read', 'bash'])
+test('reveal: defers delivery for an exact execution and only that result confirms it', () => {
+  const child = agentKey('delivery')
+  const other = agentKey('delivery-other')
+  const options = []
+  const confirmations = []
+  const revealFn = (verdict, received) => {
+    options.push(received)
+    return `predecessor:${verdict}`
+  }
+  revealFn.confirmDelivery = observation => {
+    confirmations.push(observation)
+    return observation.isError === false
+      && observation.content?.[0]?.type === 'text'
+      && observation.content[0].text === 'predecessor:locked'
+  }
+  const dispose = armReveal(child, revealFn)
+  const token = Symbol('token')
+  const exec = { name: 'boost_reveal', agent: { id: child }, token }
+  assert.equal(revealPredecessor(child, 'locked', exec), 'predecessor:locked')
+  assert.deepEqual(options, [{ deferDelivery: true }])
 
+  const delivered = { isError: false, content: [{ type: 'text', text: 'predecessor:locked' }] }
+  assert.equal(observeRevealResult({ ...exec, agent: { id: other } }, delivered), false)
+  assert.equal(observeRevealResult({ ...exec, name: 'other' }, delivered), false)
+  assert.equal(
+    observeRevealResult({ name: 'boost_reveal', agent: { id: child }, token: Symbol('other') }, delivered),
+    false,
+  )
+  assert.deepEqual(confirmations, [])
+
+  assert.equal(observeRevealResult(exec, delivered), true)
+  assert.equal(confirmations.length, 1)
+  assert.equal(confirmations[0].agentId, child)
+  assert.equal(confirmations[0].token, token)
+  assert.equal(confirmations[0].isError, false)
+  assert.deepEqual(confirmations[0].content, delivered.content)
+
+  // A duplicate observation of the same execution is not a second receipt.
+  assert.equal(observeRevealResult(exec, delivered), false)
+  assert.equal(confirmations.length, 1)
+  dispose()
+})
+
+test('reveal: direct calls do not defer, and disposing clears a pending delivery', () => {
+  const child = agentKey('delivery-dispose')
+  const options = []
+  const confirmations = []
+  const revealFn = (verdict, received) => {
+    options.push(received)
+    return `predecessor:${verdict}`
+  }
+  revealFn.confirmDelivery = observation => {
+    confirmations.push(observation)
+    return true
+  }
+  const dispose = armReveal(child, revealFn)
+
+  assert.equal(revealPredecessor(child, 'direct'), 'predecessor:direct')
+  assert.deepEqual(options, [undefined])
+
+  const token = Symbol('pending')
+  const exec = { name: 'boost_reveal', agent: { id: child }, token }
+  assert.equal(revealPredecessor(child, 'deferred', exec), 'predecessor:deferred')
+  assert.deepEqual(options, [undefined, { deferDelivery: true }])
+
+  dispose()
+  assert.equal(observeRevealResult(exec, { isError: false, content: [{ type: 'text', text: 'predecessor:deferred' }] }), false)
+  assert.deepEqual(confirmations, [])
+})
+
+test('reveal: refuses two pending deliveries for one execution token', () => {
+  const child = agentKey('delivery-duplicate')
+  let calls = 0
+  const revealFn = () => {
+    calls += 1
+    return 'report'
+  }
+  revealFn.confirmDelivery = () => true
+  const dispose = armReveal(child, revealFn)
+  const token = Symbol('duplicate')
+  const exec = { name: 'boost_reveal', agent: { id: child }, token }
+
+  assert.equal(revealPredecessor(child, 'first', exec), 'report')
+  assert.throws(() => revealPredecessor(child, 'second', exec), assertRevealError('REVEAL_ALREADY_RECORDED'))
+  assert.equal(calls, 1)
+  assert.equal(observeRevealResult(exec, { isError: false, content: [{ type: 'text', text: 'report' }] }), true)
+  dispose()
+})
+
+test('policy worker: denies every non-allowlisted global and guards the allowlist', () => {
+  const events = []
+  const calls = applyWith('worker', ['run_code', 'some_global', 'read', 'bash'], {}, events)
+
+  assert.deepEqual(events, [])
   assert.equal(calls.register.length, 0)
   assert.equal(calls.definitions.length, 1)
   assert.equal(calls.definitions[0], undefined)
@@ -149,7 +250,9 @@ test('policy worker: denies every non-allowlisted global and guards the allowlis
 test('policy reviewer: registers only boost_reveal and serves the predecessor report', async () => {
   const child = agentKey('reviewer')
   const { service, calls } = toolsService(['run_code', 'some_global'], {})
-  apply({ tools: service }, { role: 'reviewer' })
+  const events = []
+  apply(policyContext(service, events), { role: 'reviewer' })
+  assert.deepEqual(events.map(event => event.name), ['tools/result'])
 
   assert.equal(calls.register.length, 1)
   const definition = calls.register[0]
@@ -193,6 +296,53 @@ test('policy reviewer: registers only boost_reveal and serves the predecessor re
   dispose()
 })
 
+test('policy reviewer: confirms delivery through the tools/result observer for that execution', async () => {
+  const child = agentKey('reviewer-delivery')
+  const { service, calls } = toolsService(['some_global'], {})
+  const events = []
+  apply(policyContext(service, events), { role: 'reviewer' })
+  assert.deepEqual(events.map(event => event.name), ['tools/result'])
+
+  const confirmations = []
+  const revealFn = (verdict, options) => {
+    assert.deepEqual(options, { deferDelivery: true })
+    return `predecessor:${verdict}`
+  }
+  revealFn.confirmDelivery = observation => {
+    confirmations.push(observation)
+    return observation.isError === false
+  }
+  const dispose = armReveal(child, revealFn)
+  const token = Symbol('policy-token')
+  const exec = { name: 'boost_reveal', agent: { id: child }, token }
+  const definition = calls.register[0]
+
+  assert.equal(await definition.execute({ initialVerdict: 'locked' }, exec), 'predecessor:locked')
+  assert.deepEqual(confirmations, [])
+
+  events[0].handler(exec, { isError: false, content: [{ type: 'text', text: 'predecessor:locked' }] })
+  assert.equal(confirmations.length, 1)
+  assert.equal(confirmations[0].agentId, child)
+  assert.equal(confirmations[0].token, token)
+  assert.equal(confirmations[0].isError, false)
+  assert.deepEqual(confirmations[0].content, [{ type: 'text', text: 'predecessor:locked' }])
+
+  events[0].handler(exec, { isError: false, content: [{ type: 'text', text: 'predecessor:locked' }] })
+  assert.equal(confirmations.length, 1)
+  dispose()
+})
+
+test('policy reviewer: refuses to start when the tools/result observer is unavailable', () => {
+  const { service, calls } = toolsService(['some_global'])
+  assert.throws(
+    () => apply({ tools: service }, { role: 'reviewer' }),
+    /could not install its tool boundary.*tools\/result.*Refusing to start/is,
+  )
+  assert.equal(calls.register.length, 0)
+  assert.equal(calls.restrict.length, 0)
+  assert.equal(calls.guard.length, 0)
+})
+
 test('policy: rejects an unknown or missing role before installing anything', () => {
   for (const config of [undefined, null, {}, { role: 'admin' }, { role: '' }]) {
     const { service, calls } = toolsService(['some_global'])
@@ -211,7 +361,7 @@ test('policy: installation failures refuse to start and roll back partial instal
     },
   })
   assert.throws(
-    () => apply({ tools: registerFailure.service }, { role: 'reviewer' }),
+    () => apply(policyContext(registerFailure.service), { role: 'reviewer' }),
     /Refusing to start \/boost reviewer with broader permissions.*integrity/i,
   )
   assert.equal(registerFailure.calls.restrict.length, 0)

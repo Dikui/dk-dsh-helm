@@ -7,12 +7,15 @@
  * Preset-scope restrictions leave the preset's own tool rows visible; the guard
  * is the execution boundary, so a newly mounted global cannot widen the role.
  *
- * Installation is fail-closed: a failed registration, restriction, or guard
- * throws and breaks the preset mount instead of leaving an agent with broader
- * permissions.
+ * The reviewer role also observes `tools/result` so the protocol can confirm
+ * that the final model-facing content of a `boost_reveal` call really delivered
+ * the worker report after post-execute policy. Installation is fail-closed: a
+ * failed registration, restriction, guard, or missing result observer throws
+ * and breaks the preset mount instead of leaving an agent with broader
+ * permissions or an unconfirmable reveal.
  */
 
-import { BoostRevealError, revealPredecessor } from './reveal.js'
+import { BoostRevealError, observeRevealResult, revealPredecessor } from './reveal.js'
 
 /** Cordis plugin name. */
 export const name = 'boost-role'
@@ -57,12 +60,12 @@ function integrityError(role, cause) {
 }
 
 /**
- * @param {() => void} [dispose] - optional rollback action.
+ * @param {(() => void) | { dispose?: () => void }} [disposable] - optional rollback action.
  */
-function rollback(dispose) {
-  if (typeof dispose !== 'function') return
+function rollback(disposable) {
   try {
-    dispose()
+    if (typeof disposable === 'function') disposable()
+    else if (typeof disposable?.dispose === 'function') disposable.dispose()
   } catch {
     // Rollback is best-effort; the original installation error is authoritative.
   }
@@ -100,7 +103,7 @@ function createRevealTool() {
         throw new BoostRevealError('REVEAL_CALLER_REQUIRED', 'boost_reveal requires a calling agent')
       }
       const initialVerdict = args !== null && typeof args === 'object' ? args.initialVerdict : undefined
-      return revealPredecessor(agentId, initialVerdict)
+      return revealPredecessor(agentId, initialVerdict, exec)
     },
   }
 }
@@ -138,10 +141,18 @@ export function apply(ctx, config) {
     }
   }
 
+  if (role === 'reviewer' && typeof ctx.on !== 'function') {
+    throw integrityError(
+      role,
+      new Error('the runtime does not expose the tools/result event required to confirm helper delivery'),
+    )
+  }
+
   const allowed = new Set(role === 'worker' ? WORKER_ALLOWED_TOOLS : REVIEWER_ALLOWED_TOOLS)
   let registered
   let restricted
   let guarded
+  let observing
 
   try {
     if (role === 'reviewer') {
@@ -170,7 +181,21 @@ export function apply(ctx, config) {
     } catch (cause) {
       throw integrityError(role, cause)
     }
+
+    if (role === 'reviewer') {
+      try {
+        observing = ctx.on('tools/result', (exec, result) => {
+          observeRevealResult(exec, result)
+        })
+        if (observing === undefined || observing === null) {
+          throw new Error('the runtime did not retain the tools/result delivery observer')
+        }
+      } catch (cause) {
+        throw integrityError(role, cause)
+      }
+    }
   } catch (error) {
+    rollback(observing)
     rollback(guarded)
     rollback(restricted)
     rollback(registered)

@@ -55,7 +55,11 @@ export function apply(ctx) {
         `Worker report (disclosed only after initial verdict)\n${res.workerReport}`,
       ].join('\n\n') };
     } catch (error) {
+      const lockedInitialVerdict = typeof error?.initialVerdict === 'string' && error.initialVerdict.length > 0
+        ? error.initialVerdict : undefined;
       return { kind: 'error', text: [`Boost ${signal.aborted ? 'cancelled' : 'did not complete'}: ${error instanceof Error ? error.message : String(error)}`,
+        lockedInitialVerdict && `Initial verdict (locked; delivery of the worker report was not confirmed)\n${lockedInitialVerdict}`,
+        lockedInitialVerdict && 'The comparison is incomplete. No final comparison was produced.',
         evidence && summarizeCheck(evidence.check), 'No automatic rollback. Check the workspace diff before retrying.'].filter(Boolean).join('\n\n') };
     } finally {
       // Protocol rejects promptly on cancellation; retain ownership until its
