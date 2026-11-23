@@ -802,6 +802,73 @@ test('finish reports an unconfirmed dispose instead of claiming success', async 
   assert.equal(rt.state.member('root', alice.sessionId).status, 'killed');
 });
 
+test('finish retries a retained unconfirmed disposal on a later call', async (t) => {
+  const rt = await setup();
+  t.after(() => rt.host.close());
+  const alice = await addAlice(rt);
+  registerSwarmCommands(rt.host);
+  const command = rt.commands[0];
+  const handle = rt.host.handles.get(alice.sessionId);
+  let disposeCalls = 0;
+  handle.dispose = async () => {
+    disposeCalls += 1;
+    if (disposeCalls === 1) throw new Error('child is still running');
+    rt.disposals.push(alice.sessionId);
+    rt.agents.delete(alice.sessionId);
+  };
+
+  const first = await command.handler({
+    agent: rt.root,
+    rawInput: 'finish',
+    signal: new AbortController().signal,
+  });
+  assert.equal(first.kind, 'error', 'the first finish reports the unconfirmed disposal');
+  assert.match(first.text, /dispose unconfirmed|partial/i);
+  assert.equal(rt.state.member('root', alice.sessionId).status, 'killed');
+  assert.equal(disposeCalls, 1);
+  assert.equal(rt.host.handles.has(alice.sessionId), true, 'the live handle is retained for a retry');
+
+  const second = await command.handler({
+    agent: rt.root,
+    rawInput: 'finish',
+    signal: new AbortController().signal,
+  });
+  assert.equal(second.kind, 'success', 'the later finish can confirm the retained disposal');
+  assert.equal(disposeCalls, 2);
+  assert.equal(rt.host.handles.has(alice.sessionId), false);
+});
+
+test('finish ignores a transient reservation revocation failure once the final board is empty', async (t) => {
+  const rt = await setup();
+  t.after(() => rt.host.close());
+  registerSwarmCommands(rt.host);
+  const command = rt.commands[0];
+  const reserved = await rt.state.act('root', 'root', {
+    type: 'reserveJoin',
+    member: { sessionId: 'session-transient', name: 'transient', role: 'worker' },
+  });
+  const reservationId = reserved.result.reservationId;
+
+  const originalAct = rt.state.act.bind(rt.state);
+  let failJoinCalls = 0;
+  rt.state.act = async (rootId, actorId, action) => {
+    if (action.type === 'failJoin') {
+      failJoinCalls += 1;
+      if (failJoinCalls === 1) throw new Error('transient store error');
+    }
+    return originalAct(rootId, actorId, action);
+  };
+
+  const out = await command.handler({
+    agent: rt.root,
+    rawInput: 'finish',
+    signal: new AbortController().signal,
+  });
+  assert.equal(out.kind, 'success', 'a seat revoked on the retry is not reported still open');
+  assert.equal(failJoinCalls, 2);
+  assert.equal(rt.state.board('root').reservations[reservationId], undefined);
+});
+
 test('finish reports reservations it could not revoke instead of claiming success', async (t) => {
   const rt = await setup();
   t.after(() => rt.host.close());
@@ -847,6 +914,49 @@ test('concurrent finishes share one drain', async (t) => {
   const [a, b] = await Promise.all([first, second]);
   assert.deepEqual(a, b);
   assert.equal(calls, 1);
+});
+
+test('finish publishes its drain promise before a synchronous cancel callback can re-enter', async (t) => {
+  const rt = await setup();
+  t.after(() => rt.host.close());
+  const gate = deferred();
+  rt.ctx.subagents.startActivation = async (spec) => {
+    await gate.promise;
+    return {
+      childId: spec.childId,
+      result: new Promise(() => {}),
+      dispose: async () => {
+        rt.disposals.push(spec.childId);
+      },
+    };
+  };
+
+  const adding = addAlice(rt).then(
+    () => null,
+    (error) => error,
+  );
+  await waitFor(() => {
+    const guard = [...rt.host.inflightAdds.values()][0];
+    return guard?.controller && Object.keys(rt.state.board('root').reservations).length === 1;
+  }, 'the add to reserve its seat and install its abort controller');
+
+  const guard = [...rt.host.inflightAdds.values()][0];
+  let reentrant;
+  guard.controller.signal.addEventListener(
+    'abort',
+    () => {
+      reentrant = rt.host.finish('root');
+    },
+    { once: true },
+  );
+
+  const finishing = rt.host.finish('root');
+  assert.ok(reentrant instanceof Promise, 'the synchronous abort listener can join the published drain');
+  gate.resolve();
+  const [outcome, reentrantOutcome] = await Promise.all([finishing, reentrant]);
+  assert.deepEqual(reentrantOutcome, outcome);
+  assert.equal(outcome.failed.length, 0);
+  assert.match(String(await adding), /finish|cancel/i);
 });
 
 test('finish waits for an in-flight add whose spawn ignores the signal, revokes it, and keeps the board open', async (t) => {

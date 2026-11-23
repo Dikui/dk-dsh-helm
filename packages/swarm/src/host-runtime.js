@@ -48,6 +48,9 @@ export class SwarmHost {
     this.retiredActivations = new WeakSet();
     this.inflightAdds = new Map();
     this.drains = new Map();
+    // Disposals that could not be confirmed, scoped by root. finish retries
+    // these on later calls instead of forgetting a possibly live child.
+    this.unconfirmedDisposals = new Map();
     // A tool result can be blocked or rewritten after execute() returns. Keep
     // the exact page until tools/result confirms the model saw it.
     this.pendingReads = new Map();
@@ -390,25 +393,65 @@ export class SwarmHost {
     }
   }
 
+  rememberUnconfirmedDisposal(rootId, sessionId, activation, error) {
+    if (!rootId || !sessionId || !activation) return;
+    let pending = this.unconfirmedDisposals.get(rootId);
+    if (!pending) {
+      pending = new Map();
+      this.unconfirmedDisposals.set(rootId, pending);
+    }
+    pending.set(sessionId, { activation, error });
+  }
+
+  clearUnconfirmedDisposal(rootId, sessionId) {
+    const pending = this.unconfirmedDisposals.get(rootId);
+    if (!pending) return;
+    pending.delete(sessionId);
+    if (pending.size === 0) this.unconfirmedDisposals.delete(rootId);
+  }
+
+  interruptActivation(rootId, sessionId) {
+    if (!sessionId) return;
+    try {
+      const pending = this.ctx.subagents?.interrupt?.(sessionId, {
+        kind: 'ancestor',
+        agent: this.state.rootAgent(rootId),
+      });
+      // interrupt may be async. Attach the handler immediately so a rejection
+      // is logged instead of becoming an unhandled rejection.
+      if (pending && typeof pending.catch === 'function') {
+        pending.catch((error) => this.log('warn', `interrupt fallback for ${sessionId} failed`, error));
+      }
+    } catch (error) {
+      this.log('warn', `interrupt fallback for ${sessionId} failed`, error);
+    }
+  }
+
   async disposeActivation(activation, { rootId, sessionId } = {}) {
     if (!activation) return { ok: true };
     this.retiredActivations.add(activation);
     try {
       await activation.dispose?.();
+      if (rootId && sessionId) this.clearUnconfirmedDisposal(rootId, sessionId);
       return { ok: true };
     } catch (error) {
       this.log('warn', `could not dispose activation${sessionId ? ` ${sessionId}` : ''}`, error);
+      if (rootId && sessionId) this.rememberUnconfirmedDisposal(rootId, sessionId, activation, error);
       // Interrupt is a weaker fallback: it may stop the child but does not
       // confirm that the activation was disposed.
-      try {
-        this.ctx.subagents?.interrupt?.(sessionId, {
-          kind: 'ancestor',
-          agent: this.state.rootAgent(rootId),
-        });
-      } catch {
-        // Nothing else to try; the caller reports the failure.
-      }
+      this.interruptActivation(rootId, sessionId);
       return { ok: false, error };
+    }
+  }
+
+  async retryUnconfirmedDisposals(rootId) {
+    const pending = this.unconfirmedDisposals.get(rootId);
+    if (!pending || pending.size === 0) return;
+    for (const [sessionId, record] of [...pending.entries()]) {
+      const disposed = await this.disposeActivation(record.activation, { rootId, sessionId });
+      if (disposed.ok && this.handles.get(sessionId) === record.activation) {
+        this.handles.delete(sessionId);
+      }
     }
   }
 
@@ -424,20 +467,19 @@ export class SwarmHost {
   async runFinish(rootId) {
     const killed = [];
     const failed = [];
+    const reportedDispose = new Set();
     const guards = [...this.inflightAdds.values()].filter((guard) => guard.rootId === rootId);
     for (const guard of guards) this.cancelInflightAdd(guard, 'swarm finish');
-    const unresolved = new Set(await this.failOpenReservations(rootId, 'swarm finish'));
+    // The first revocation may fail transiently while the add is still
+    // unwinding. Only the final board decides whether a seat is really open.
+    await this.failOpenReservations(rootId, 'swarm finish');
     await Promise.all(guards.map((guard) => guard.done));
-    for (const reservationId of await this.failOpenReservations(rootId, 'swarm finish')) {
-      unresolved.add(reservationId);
-    }
-    for (const guard of guards) {
-      if (guard.disposeError) {
-        failed.push(
-          `${guard.sessionId}: dispose unconfirmed: ${guard.disposeError instanceof Error ? guard.disposeError.message : String(guard.disposeError)}`,
-        );
-      }
-    }
+    await this.failOpenReservations(rootId, 'swarm finish');
+
+    // Retry disposals retained by an earlier finish, an add compensation, or a
+    // kill that could not confirm the child was gone.
+    await this.retryUnconfirmedDisposals(rootId);
+
     const board = this.state.board(rootId);
     for (const member of Object.values(board?.members ?? {})) {
       if (member.role === 'coordinator' || member.status === 'killed') continue;
@@ -447,13 +489,16 @@ export class SwarmHost {
       } catch (error) {
         this.log('warn', `finish could not kill ${member.name}`, error);
         failed.push(`${member.name}: ${error instanceof Error ? error.message : String(error)}`);
+        if (error?.code === 'DISPOSE_FAILED') reportedDispose.add(member.sessionId);
       }
     }
     for (const reservationId of Object.keys(this.state.board(rootId)?.reservations ?? {})) {
-      unresolved.add(reservationId);
-    }
-    for (const reservationId of unresolved) {
       failed.push(`reservation ${reservationId}: still open`);
+    }
+    for (const [sessionId, record] of this.unconfirmedDisposals.get(rootId) ?? []) {
+      if (reportedDispose.has(sessionId)) continue;
+      const message = record.error instanceof Error ? record.error.message : String(record.error);
+      failed.push(`${sessionId}: dispose unconfirmed: ${message}`);
     }
     return { killed, failed, cancelled: guards.length };
   }
@@ -469,12 +514,25 @@ export class SwarmHost {
     if (running) return running.promise;
     if (!this.state.board(rootId)) throw failure('NOT_MEMBER', 'no swarm board');
     const drain = {};
-    // Publish the drain before runFinish starts cancelling: an abort listener
-    // must not be able to slip a new add into this root mid-drain.
-    this.drains.set(rootId, drain);
-    drain.promise = this.runFinish(rootId).finally(() => {
-      if (this.drains.get(rootId) === drain) this.drains.delete(rootId);
+    let settle;
+    drain.promise = new Promise((resolve, reject) => {
+      settle = { resolve, reject };
     });
+    // Publish an awaitable promise before runFinish starts cancelling. An abort
+    // listener runs synchronously inside runFinish and may call finish again;
+    // it must join this drain instead of starting a second one.
+    this.drains.set(rootId, drain);
+    const job = this.runFinish(rootId);
+    job.then(
+      (outcome) => {
+        if (this.drains.get(rootId) === drain) this.drains.delete(rootId);
+        settle.resolve(outcome);
+      },
+      (error) => {
+        if (this.drains.get(rootId) === drain) this.drains.delete(rootId);
+        settle.reject(error);
+      },
+    );
     return drain.promise;
   }
 
@@ -742,11 +800,7 @@ export class SwarmHost {
         if (disposed.ok) this.handles.delete(member.sessionId);
         else disposeFailure = disposed.error;
       }
-      try {
-        this.ctx.subagents?.interrupt?.(member.sessionId, { kind: 'ancestor', agent: this.state.rootAgent(rootId) });
-      } catch {
-        // A member that is not live has nothing to interrupt.
-      }
+      this.interruptActivation(rootId, member.sessionId);
       if (disposeFailure) {
         throw failure(
           'DISPOSE_FAILED',
