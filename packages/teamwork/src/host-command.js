@@ -8,10 +8,10 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { resolve as resolvePath } from 'node:path'
 import { parseTeamworkInput, matchesConfirmLine, isValidRunId, USAGE } from './host-input.js'
 import { executeCampaign } from './host-runner.js'
 import { bounded } from './host-text.js'
+import { workdirMatches } from './campaign.js'
 
 const HELP = USAGE
 const TERMINAL = new Set(['done', 'failed', 'cancelled'])
@@ -233,7 +233,7 @@ export function apply(ctx, modules) {
     if (!value) value = await ctx.workingDirectory.ensure(root, signal)
     const target = await ctx.fs.resolve(value, { signal })
     const cwd = ctx.fs.processPath(target)
-    const key = String(target?.targetKey ?? cwd).replace(/[\\/]+$/u, '') || cwd
+    const key = String(target?.targetKey ?? cwd)
     return { cwd, key }
   }
 
@@ -244,17 +244,10 @@ export function apply(ctx, modules) {
   const sameWorkspaceDirectory = async (requested, base, signal) => {
     const target = await ctx.fs.resolve(requested, { cwd: base, signal })
     const requestedPath = ctx.fs.processPath(target)
-    const requestedKey = String(target?.targetKey ?? requestedPath).replace(/[\\/]+$/u, '') || requestedPath
     const anchorTarget = await ctx.fs.resolve(base, { cwd: base, signal })
     const anchorPath = ctx.fs.processPath(anchorTarget)
-    const anchorKey = String(anchorTarget?.targetKey ?? anchorPath).replace(/[\\/]+$/u, '') || anchorPath
-    if (requestedKey === anchorKey) return true
-    const normalize = value => {
-      let resolved = resolvePath(value)
-      if (resolved.length > 1) resolved = resolved.replace(/[\\/]+$/u, '')
-      return process.platform === 'win32' ? resolved.toLowerCase() : resolved
-    }
-    return normalize(requestedPath) === normalize(anchorPath)
+    if (String(target?.targetKey ?? requestedPath) === String(anchorTarget?.targetKey ?? anchorPath)) return true
+    return workdirMatches(anchorPath, requestedPath)
   }
 
   const workdirRejectedText = (raw, cwd) => (

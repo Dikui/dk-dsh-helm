@@ -306,6 +306,21 @@ test('confirmation accepts an equivalent workdir spelling and freezes the creati
   assert.equal(r.state.spec.workdir, '/tmp/demo');
 });
 
+test('POSIX backslash is a filename character, not a directory separator', { skip: process.platform === 'win32' }, () => {
+  const state = createCampaignState({
+    ...base(), skipInterview: false, confirmedCommand: undefined, mode: 'general',
+  });
+  const answers = fullAnswers();
+  delete answers.workdir;
+  let r = step(state, { type: 'interview-answer', values: answers });
+  assert.equal(r.result.ok, true);
+  r = step(r.state, { type: 'interview-answer', values: { workdir: '/tmp/demo\\' } });
+  assert.equal(r.result.ok, false);
+  assert.equal(r.result.code, 'INVALID_ANSWER');
+  assert.match(r.result.reason, /@cwd \/tmp\/demo\\/u);
+  assert.equal(r.state.interview.answers.workdir, undefined);
+});
+
 test('resume rejects a legacy paused run whose frozen workdir differs from its workspace', () => {
   let state = confirmedState();
   state = startTask(state, 'impl-r1', 'impl-1');
@@ -360,7 +375,8 @@ test('frozen integrity restrictions and constraints reach the task prompt for ex
   assert.match(prompts, /Constraints: Node 22; no dependencies/u);
 });
 
-test('an interview answer can be applied in one batch and rebuilds the draft', () => {  let state = createCampaignState({
+test('an interview answer can be applied in one batch and rebuilds the draft', () => {
+  let state = createCampaignState({
     ...base(), skipInterview: false, confirmedCommand: undefined, mode: 'general',
   });
   assert.equal(state.status, 'draft');
@@ -880,6 +896,17 @@ test('distinct verifier reasons stay distinct and do not trigger oscillation', (
   const brief = buildRetryBrief(state);
   assert.match(brief, /rounding regression in the invoice total/u);
   assert.ok(!brief.includes('same failure signature repeated'));
+});
+
+test('verifier reasons that differ after a long shared prefix still do not oscillate', () => {
+  const prefix = 'the same leading explanation '.repeat(24);
+  let state = confirmedState({ maxRounds: 5 });
+  state = failReview(state, 1, `${prefix} first root cause`).state;
+  const r = failReview(state, 2, `${prefix} second root cause`);
+  assert.equal(r.state.status, 'running');
+  assert.equal(r.state.rounds.current, 3);
+  assert.equal(r.state.rounds.consecutiveFailures, 1);
+  assert.ok(!r.effects.includes('pause'));
 });
 
 test('the same verifier reason still trips the oscillation guard', () => {

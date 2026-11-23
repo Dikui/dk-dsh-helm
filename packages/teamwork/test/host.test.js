@@ -109,15 +109,17 @@ test('oversized reports fail closed instead of being truncated and accepted', ()
   assert.match(audit.reason, /exceeds the .* parse limit/u)
 })
 
-test('report storage is bounded without losing the verdict', () => {
+test('report storage clips display fields without dropping semantic entries', () => {
   const longSummary = 's'.repeat(1000)
   const lines = ['VERDICT|pass|ok']
   for (let i = 0; i < 300; i += 1) lines.push(`ISSUE|low|${longSummary}|src/a.js:${i}`)
+  lines.push('ISSUE|integrity|late integrity finding|src/a.js:300')
   const report = parseRoleVerdict(lines.join('\n'))
   assert.equal(report.verdict, 'pass')
-  assert.equal(report.issues.length, 200)
+  assert.equal(report.issues.length, 301)
+  assert.equal(report.issues.at(-1).severity, 'integrity')
   assert.ok(report.issues[0].summary.length < 600)
-  assert.ok(report.warnings.some(warning => /additional ISSUE entries after 200/u.test(warning)))
+  assert.ok(!report.warnings.some(warning => /additional ISSUE entries/u.test(warning)))
 
   const malformed = ['VERDICT|pass|ok']
   for (let i = 0; i < 100; i += 1) malformed.push(`ISSUE|bogus|bad|src/a.js:${i}`)
@@ -146,8 +148,10 @@ test('the frozen spec reaches execution, review, and audit prompts as authoritat
     const prompt = buildRolePrompt({
       role, taskId: `${role}-1`, mode: 'general', runId: 'tw-abc-123456',
       cwd: '/tmp/work', taskPrompt: 'Do the task.', spec,
+      originalRequest: 'Build the ledger.',
     })
     assert.match(prompt, /FROZEN CAMPAIGN SPEC \(authoritative/u)
+    assert.match(prompt, /ORIGINAL REQUEST \(historical context; the confirmed frozen campaign spec, when present, is authoritative on conflict\)/u)
     assert.match(prompt, /Integrity restrictions: dependencies outside the standard library; hardcoded acceptance output/u)
     assert.match(prompt, /Standard library only: yes/u)
     assert.match(prompt, /Constraints: Node 22; no dependencies/u)
@@ -427,6 +431,13 @@ test('command: an answer cannot move the draft workdir to another directory', as
   assert.equal(rejected.kind, 'error', rejected.text)
   assert.match(rejected.text, /WORKDIR_MISMATCH|@cwd \/tmp\/other|No answer accepted/u)
   assert.equal(harness.children.length, 0)
+
+  if (process.platform !== 'win32') {
+    const backslash = await harness.call(`answer ${state.runId} workdir /tmp/teamwork-command\\`)
+    assert.equal(backslash.kind, 'error', backslash.text)
+    assert.match(backslash.text, /WORKDIR_MISMATCH|@cwd \/tmp\/teamwork-command\\|No answer accepted/u)
+    assert.equal(harness.children.length, 0)
+  }
 
   const accepted = await harness.call(`answer ${state.runId} workdir /tmp/teamwork-link`)
   assert.equal(accepted.kind, 'success', accepted.text)

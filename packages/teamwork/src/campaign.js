@@ -5,6 +5,7 @@
 
 import { createHash } from 'node:crypto';
 import { resolve as resolvePath } from 'node:path';
+import { formatFrozenSpec } from './frozen-spec.js';
 import {
   INTERVIEW_STEPS,
   REQUIRED_INTERVIEW_KEYS,
@@ -79,8 +80,7 @@ function textOf(value, limit = PROMPT_LIMIT) {
 function normalizeDirectory(value, base) {
   const raw = textOf(value, 4096);
   if (!raw) return '';
-  let resolved = resolvePath(base || process.cwd(), raw);
-  if (resolved.length > 1) resolved = resolved.replace(/[\\/]+$/u, '');
+  const resolved = resolvePath(base || process.cwd(), raw);
   return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
 }
 
@@ -238,22 +238,11 @@ function recordProgress(state, at) {
 }
 
 function specPrompt(state) {
-  const s = state.spec;
-  const objectiveLine = s.text.split('\n').find(l => l.startsWith('Objective:')) || '';
-  const objective = objectiveLine.slice('Objective:'.length).trim() || 'see frozen spec';
-  return [
-    `Objective: ${objective}`,
-    `Route: ${s.routeSignals.route || state.route}`,
-    `Integrity mode: ${s.integrity.mode}`,
-    `Integrity restrictions: ${s.integrity.notAllowed?.length ? s.integrity.notAllowed.join('; ') : 'none recorded'}`,
-    `Standard library only: ${s.integrity.standardLibraryOnly ? 'yes' : 'no'}`,
-    `Deliverables: ${s.deliverables.length ? s.deliverables.join('; ') : 'see frozen spec'}`,
-    `Constraints: ${s.constraints.length ? s.constraints.join('; ') : 'none recorded'}`,
-    `Files: ${s.files?.length ? s.files.join('; ') : 'none'}`,
-    `Acceptance: ${s.acceptance || s.confirmedCommand || 'see frozen spec'}`,
-    `Verification command: ${s.confirmedCommand || 'not set'}`,
-    `Workdir: ${s.workdir || state.cwd}`,
-  ].join('\n');
+  return formatFrozenSpec(state.spec, {
+    cwd: state.cwd,
+    route: state.spec.routeSignals.route || state.route,
+    heading: false,
+  });
 }
 
 function implementerPrompt(state) {
@@ -955,7 +944,7 @@ function roleResult(state, event, at) {
 
   task.finishedAt = at;
   task.outcome = outcome;
-  task.failureReason = textOf(verdict.reason || event.reason, 512);
+  task.failureReason = textOf(verdict.reason || event.reason, 2048);
   if (event.report) task.report = textOf(event.report, 1600);
 
   if (event.evidence) {

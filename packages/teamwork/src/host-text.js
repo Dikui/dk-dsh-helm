@@ -9,6 +9,8 @@
  * failed verification, never an implicit pass.
  */
 
+import { formatFrozenSpec } from './frozen-spec.js'
+
 const VERDICTS = new Set(['pass', 'fail', 'veto'])
 const SEVERITIES = new Set(['low', 'medium', 'high', 'critical', 'blocker', 'integrity'])
 
@@ -19,7 +21,6 @@ const REPORT_SCAN_LIMIT = 512 * 1024
 const REPORT_WARNING_LIMIT = 50
 const REPORT_LINE_LIMIT = 300
 const REPORT_REASON_LIMIT = 2000
-const REPORT_ITEM_LIMIT = 200
 const REPORT_ITEM_TEXT_LIMIT = 500
 
 /**
@@ -45,21 +46,6 @@ function warn(warnings, message) {
   }
   warnings.push(clipText(message, REPORT_LINE_LIMIT))
 }
-
-/**
- * @param {object[]} list
- * @param {object} item
- * @param {string[]} warnings
- * @param {string} label
- */
-function addItem(list, item, warnings, label) {
-  if (list.length < REPORT_ITEM_LIMIT) {
-    list.push(item)
-    return
-  }
-  warn(warnings, `Ignored additional ${label} entries after ${REPORT_ITEM_LIMIT}.`)
-}
-
 
 /**
  * @param {string} text
@@ -152,11 +138,11 @@ export function parseRoleVerdict(text) {
           continue
         }
         const [summary, evidence = ''] = match[2].split(/\s*\|\s*evidence\s*:\s*/iu)
-        addItem(issues, {
+        issues.push({
           severity: match[1].toLowerCase(),
           summary: clipText(summary.trim(), REPORT_ITEM_TEXT_LIMIT),
           evidence: clipText(evidence.trim(), REPORT_ITEM_TEXT_LIMIT),
-        }, warnings, 'ISSUE')
+        })
         continue
       }
       const severity = (piped[1] ?? '').toLowerCase()
@@ -167,11 +153,11 @@ export function parseRoleVerdict(text) {
         reportError = true
         continue
       }
-      addItem(issues, {
+      issues.push({
         severity,
         summary: clipText(summary, REPORT_ITEM_TEXT_LIMIT),
         evidence: clipText(evidence, REPORT_ITEM_TEXT_LIMIT),
-      }, warnings, 'ISSUE')
+      })
       continue
     }
     if (head === 'FIXED' || head === 'STILL') {
@@ -186,7 +172,8 @@ export function parseRoleVerdict(text) {
         warn(warnings, `Ignored FIXED ${parsed.issueId} without usable evidence: ${line}`)
         continue
       }
-      addItem(head === 'FIXED' ? fixed : still, parsed, warnings, head)
+      const reference = head === 'FIXED' ? fixed : still
+      reference.push(parsed)
       continue
     }
     if (/^VERDICT\s*:/iu.test(line)) {
@@ -204,7 +191,8 @@ export function parseRoleVerdict(text) {
       } else if (headColon === 'FIXED' && !usableEvidence(parsed.evidence)) {
         warn(warnings, `Ignored FIXED ${parsed.issueId} without usable evidence: ${line}`)
       } else {
-        addItem(headColon === 'FIXED' ? fixed : still, parsed, warnings, headColon)
+        const reference = headColon === 'FIXED' ? fixed : still
+        reference.push(parsed)
       }
       continue
     }
@@ -433,29 +421,7 @@ export function isVerifier(role) {
  * @returns {string}
  */
 function frozenSpecBlock(spec, cwd) {
-  const source = spec && typeof spec === 'object' ? spec : {}
-  const objectiveLine = typeof source.text === 'string'
-    ? source.text.split('\n').find(line => line.startsWith('Objective:')) || ''
-    : ''
-  const objective = objectiveLine.slice('Objective:'.length).trim() || 'see frozen spec'
-  const list = values => (Array.isArray(values) && values.length > 0
-    ? values.map(value => String(value).trim()).filter(Boolean).join('; ')
-    : 'none recorded')
-  const integrity = source.integrity && typeof source.integrity === 'object' ? source.integrity : {}
-  return [
-    'FROZEN CAMPAIGN SPEC (authoritative; confirmed by the human; do not weaken, narrow, or replace it)',
-    `Objective: ${objective}`,
-    `Workdir: ${String(source.workdir || cwd || '')}`,
-    `Acceptance: ${String(source.acceptance || source.confirmedCommand || '')}`,
-    `Verification command: ${String(source.confirmedCommand || 'not set')}`,
-    `Deliverables: ${list(source.deliverables)}`,
-    `Constraints: ${list(source.constraints)}`,
-    `Files: ${list(source.files)}`,
-    `Integrity mode: ${String(integrity.mode || 'not recorded')}`,
-    `Integrity selections: ${list(integrity.selected)}`,
-    `Integrity restrictions: ${list(integrity.notAllowed)}`,
-    `Standard library only: ${integrity.standardLibraryOnly ? 'yes' : 'no'}`,
-  ].join('\n')
+  return formatFrozenSpec(spec, { cwd })
 }
 
 /**
@@ -509,7 +475,7 @@ export function buildRolePrompt({
     '- Policy is not an OS jail. For the implementer, the write scope is honest intent enforced by the prompt; report any need to exceed it instead of exceeding it.',
   ]
   if (asText(originalRequest)) {
-    lines.push('', 'ORIGINAL REQUEST (frozen at confirmation; the source of truth)', bounded(originalRequest, 6000))
+    lines.push('', 'ORIGINAL REQUEST (historical context; the confirmed frozen campaign spec, when present, is authoritative on conflict)', bounded(originalRequest, 6000))
   }
   if (spec && typeof spec === 'object') {
     lines.push('', frozenSpecBlock(spec, cwd))
