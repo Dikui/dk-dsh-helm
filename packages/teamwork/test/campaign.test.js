@@ -25,6 +25,7 @@ import {
   buildInterviewDraft,
   validateInterviewAnswer,
 } from '../src/interview.js';
+import { buildRetryBrief } from '../src/host-runner.js';
 import { createMemoryStore } from './support/memory-store.js';
 
 const NOW = Date.UTC(2026, 0, 1, 0, 0, 0);
@@ -64,6 +65,20 @@ function confirmedState(over = {}) {
   return r.state;
 }
 
+function fullAnswers(over = {}) {
+  return {
+    objective: 'Build a deterministic ledger',
+    users: 'Developers running long campaigns',
+    restrictions: 'a,b,c,d',
+    deliverables: 'src/ledger.js, tests',
+    constraints: 'Node 22, no dependencies',
+    acceptance: 'npm test',
+    route: 'swe-light',
+    workdir: '/tmp/demo',
+    ...over,
+  };
+}
+
 function taskOf(state, id) {
   const task = state.plan.tasks.find(t => t.id === id);
   assert.ok(task, `missing task ${id}`);
@@ -94,6 +109,18 @@ function failTask(state, id, childSessionId, reason = 'failed') {
     outcome: 'fail', verdict: { outcome: 'fail', reason },
   });
   assert.equal(r.result.ok, true, `fail ${id} failed: ${r.result.code}`);
+  return r;
+}
+
+// Mirrors the host runner: reviewer failures arrive as a string verdict plus a
+// top-level reason, not as a nested verdict object.
+function failReview(state, round, reason) {
+  let s = completeSweRound(state, round);
+  const r = step(s, {
+    type: 'role-result', taskId: `review-r${round}`, role: 'reviewer',
+    childSessionId: `rev-${round}`, outcome: 'fail', verdict: 'fail', reason,
+  });
+  assert.equal(r.result.ok, true, `review fail ${round} failed: ${r.result.code}`);
   return r;
 }
 
@@ -213,8 +240,127 @@ test('skip-interview still produces a visible draft and waits for manual confirm
   assert.equal(wrong.result.code, 'TEXT_MISMATCH');
 });
 
-test('an interview answer can be applied in one batch and rebuilds the draft', () => {
+test('the interview workdir is fixed at draft creation and aliases normalize to the campaign cwd', () => {
   let state = createCampaignState({
+    ...base(), skipInterview: false, confirmedCommand: undefined, mode: 'general',
+  });
+  const withoutWorkdir = fullAnswers();
+  delete withoutWorkdir.workdir;
+  let r = step(state, { type: 'interview-answer', values: withoutWorkdir });
+  assert.equal(r.result.ok, true);
+  assert.equal(r.result.accepted.length, 7);
+
+  r = step(r.state, { type: 'interview-answer', values: { workdir: '/tmp/other' } });
+  assert.equal(r.result.ok, false);
+  assert.equal(r.result.code, 'INVALID_ANSWER');
+  assert.match(r.result.reason, /@cwd \/tmp\/other/u);
+  assert.equal(r.state.interview.answers.workdir, undefined);
+  assert.equal(r.state.status, 'draft');
+
+  r = step(r.state, { type: 'interview-answer', values: { workdir: '/tmp/demo/' } });
+  assert.equal(r.result.ok, true);
+  assert.deepEqual(r.result.accepted, ['workdir']);
+  assert.equal(r.state.interview.answers.workdir, '/tmp/demo');
+  assert.equal(r.state.interview.draft.workdir, '/tmp/demo');
+  assert.match(r.state.interview.draft.text, /Workdir: \/tmp\/demo/u);
+});
+
+test('bulk answers and skip-interview reject a workdir outside the creation directory', () => {
+  assert.throws(
+    () => createCampaignState(base({ answers: fullAnswers({ workdir: '/tmp/other' }) })),
+    error => /WORKDIR_MISMATCH/u.test(error.message) && /@cwd \/tmp\/other/u.test(error.message),
+  );
+  assert.throws(
+    () => createCampaignState({
+      ...base(), skipInterview: false, confirmedCommand: undefined, mode: 'general',
+      answers: fullAnswers({ workdir: '/tmp/other' }),
+    }),
+    /WORKDIR_MISMATCH/u,
+  );
+});
+
+test('confirmation rejects a legacy draft that names a different workdir', () => {
+  const state = createCampaignState(base());
+  const draft = state.interview.draft;
+  const moved = { ...state, interview: { ...state.interview, draft: { ...draft, workdir: '/tmp/other' } } };
+  const r = step(moved, {
+    type: 'confirm', text: draft.confirmLine, token: draft.token,
+    version: draft.version, source: 'manual-chat',
+  });
+  assert.equal(r.result.ok, false);
+  assert.equal(r.result.code, 'WORKDIR_MISMATCH');
+  assert.match(r.result.reason, /@cwd \/tmp\/other/u);
+  assert.equal(r.state.status, 'awaiting-confirm');
+});
+
+test('confirmation accepts an equivalent workdir spelling and freezes the creation cwd', () => {
+  const state = createCampaignState(base());
+  const draft = state.interview.draft;
+  const equivalent = { ...state, interview: { ...state.interview, draft: { ...draft, workdir: '/tmp/demo/' } } };
+  const r = step(equivalent, {
+    type: 'confirm', text: draft.confirmLine, token: draft.token,
+    version: draft.version, source: 'manual-chat',
+  });
+  assert.equal(r.result.ok, true, r.result.reason);
+  assert.equal(r.state.status, 'running');
+  assert.equal(r.state.spec.workdir, '/tmp/demo');
+});
+
+test('resume rejects a legacy paused run whose frozen workdir differs from its workspace', () => {
+  let state = confirmedState();
+  state = startTask(state, 'impl-r1', 'impl-1');
+  state = failTask(state, 'impl-r1', 'impl-1', 'real failure').state;
+  const legacy = {
+    ...state,
+    spec: { ...state.spec, workdir: '/tmp/other' },
+    failure: { ...state.failure, reason: 'real failure' },
+  };
+  const r = step(legacy, { type: 'resume', source: 'manual-chat' });
+  assert.equal(r.result.ok, false);
+  assert.equal(r.result.code, 'WORKDIR_MISMATCH');
+  assert.equal(r.state.status, 'paused');
+  assert.equal(r.state.failure.code, 'ROLE_FAILED');
+  assert.match(r.state.failure.reason, /real failure/u);
+});
+
+test('a second pause never overwrites the failure that actually paused the run', () => {
+  let state = confirmedState();
+  state = startTask(state, 'impl-r1', 'impl-1');
+  const failed = failTask(state, 'impl-r1', 'impl-1', 'real pause cause');
+  state = failed.state;
+  assert.equal(state.status, 'paused');
+  assert.equal(state.failure.code, 'ROLE_FAILED');
+  const originalReason = state.failure.reason;
+
+  const second = step(state, {
+    type: 'pause', source: 'manual-chat', reason: 'a later secondary pause',
+  });
+  assert.equal(second.result.ok, true);
+  assert.equal(second.result.code, 'ALREADY_PAUSED');
+  assert.equal(second.state.status, 'paused');
+  assert.equal(second.state.failure.code, 'ROLE_FAILED');
+  assert.equal(second.state.failure.reason, originalReason);
+  assert.ok(!second.effects.includes('pause'));
+});
+
+test('a manual pause records the caller reason instead of a generic placeholder', () => {
+  const state = confirmedState();
+  const r = step(state, { type: 'pause', source: 'manual-chat', reason: 'paused by root session' });
+  assert.equal(r.result.ok, true);
+  assert.equal(r.state.failure.code, 'MANUAL_PAUSE');
+  assert.equal(r.state.failure.reason, 'paused by root session');
+});
+
+test('frozen integrity restrictions and constraints reach the task prompt for execution and review', () => {
+  const state = confirmedState({ answers: fullAnswers() });
+  const prompts = state.plan.tasks.map(task => task.prompt).join('\n');
+  assert.match(prompts, /Integrity mode: benchmark/u);
+  assert.match(prompts, /dependencies outside the standard library/u);
+  assert.match(prompts, /Standard library only: yes/u);
+  assert.match(prompts, /Constraints: Node 22; no dependencies/u);
+});
+
+test('an interview answer can be applied in one batch and rebuilds the draft', () => {  let state = createCampaignState({
     ...base(), skipInterview: false, confirmedCommand: undefined, mode: 'general',
   });
   assert.equal(state.status, 'draft');
@@ -713,6 +859,35 @@ test('repeated identical failure signature triggers oscillation guard', () => {
   state = r.state;
   assert.equal(state.status, 'paused');
   assert.equal(state.failure.code, 'OSCILLATION');
+  assert.ok(r.effects.includes('pause'));
+});
+
+test('distinct verifier reasons stay distinct and do not trigger oscillation', () => {
+  let state = confirmedState({ maxRounds: 5 });
+  let r = failReview(state, 1, 'missing the negative-price edge case');
+  state = r.state;
+  assert.equal(state.status, 'running');
+  assert.equal(state.rounds.current, 2);
+  assert.equal(state.rounds.history.at(-1).failed[0].reason, 'missing the negative-price edge case');
+  assert.match(buildRetryBrief(state), /missing the negative-price edge case/u);
+
+  r = failReview(state, 2, 'rounding regression in the invoice total');
+  state = r.state;
+  assert.equal(state.status, 'running');
+  assert.equal(state.rounds.current, 3);
+  assert.equal(state.rounds.consecutiveFailures, 1);
+  assert.equal(state.rounds.history.at(-1).failed[0].reason, 'rounding regression in the invoice total');
+  const brief = buildRetryBrief(state);
+  assert.match(brief, /rounding regression in the invoice total/u);
+  assert.ok(!brief.includes('same failure signature repeated'));
+});
+
+test('the same verifier reason still trips the oscillation guard', () => {
+  let state = confirmedState({ maxRounds: 5 });
+  state = failReview(state, 1, 'the same unresolved bug').state;
+  const r = failReview(state, 2, 'the same unresolved bug');
+  assert.equal(r.state.status, 'paused');
+  assert.equal(r.state.failure.code, 'OSCILLATION');
   assert.ok(r.effects.includes('pause'));
 });
 

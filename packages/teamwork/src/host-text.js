@@ -12,6 +12,55 @@
 const VERDICTS = new Set(['pass', 'fail', 'veto'])
 const SEVERITIES = new Set(['low', 'medium', 'high', 'critical', 'blocker', 'integrity'])
 
+// Reports are parsed in full, never from a prefix: a veto in the tail of a long
+// report must not be lost.  A report larger than this is rejected fail-closed
+// rather than silently truncated.
+const REPORT_SCAN_LIMIT = 512 * 1024
+const REPORT_WARNING_LIMIT = 50
+const REPORT_LINE_LIMIT = 300
+const REPORT_REASON_LIMIT = 2000
+const REPORT_ITEM_LIMIT = 200
+const REPORT_ITEM_TEXT_LIMIT = 500
+
+/**
+ * @param {unknown} value
+ * @param {number} max
+ * @returns {string}
+ */
+function clipText(value, max) {
+  const text = String(value ?? '')
+  return text.length <= max ? text : `${text.slice(0, max)}…[clipped ${text.length - max} characters]`
+}
+
+/**
+ * @param {string[]} warnings
+ * @param {string} message
+ */
+function warn(warnings, message) {
+  if (warnings.length >= REPORT_WARNING_LIMIT) {
+    if (warnings.length === REPORT_WARNING_LIMIT) {
+      warnings.push(`Additional warnings omitted after ${REPORT_WARNING_LIMIT} entries.`)
+    }
+    return
+  }
+  warnings.push(clipText(message, REPORT_LINE_LIMIT))
+}
+
+/**
+ * @param {object[]} list
+ * @param {object} item
+ * @param {string[]} warnings
+ * @param {string} label
+ */
+function addItem(list, item, warnings, label) {
+  if (list.length < REPORT_ITEM_LIMIT) {
+    list.push(item)
+    return
+  }
+  warn(warnings, `Ignored additional ${label} entries after ${REPORT_ITEM_LIMIT}.`)
+}
+
+
 /**
  * @param {string} text
  * @param {number} max
@@ -65,8 +114,20 @@ export function parseRoleVerdict(text) {
   const seenVerdicts = []
   let reason = ''
   let reportError = false
+  const source = typeof text === 'string' ? text : String(text ?? '')
 
-  for (const rawLine of bounded(text, 20000).split('\n')) {
+  if (source.length > REPORT_SCAN_LIMIT) {
+    return {
+      verdict: 'fail',
+      reason: `Reviewer report exceeds the ${REPORT_SCAN_LIMIT}-character parse limit; it cannot be accepted.`,
+      issues,
+      fixed,
+      still,
+      warnings: [`Report length ${source.length} exceeds ${REPORT_SCAN_LIMIT}; not parsed.`],
+    }
+  }
+
+  for (const rawLine of source.split('\n')) {
     const line = rawLine.trim()
     if (!line) continue
 
@@ -75,7 +136,7 @@ export function parseRoleVerdict(text) {
     if (head === 'VERDICT') {
       const value = (piped[1] ?? '').toLowerCase()
       if (!VERDICTS.has(value)) {
-        warnings.push(`Ignored VERDICT line with unknown value: ${line}`)
+        warn(warnings, `Ignored VERDICT line with unknown value: ${line}`)
         continue
       }
       seenVerdicts.push({ value, reason: asText(piped.slice(2).join(' | ')) ?? '' })
@@ -86,38 +147,46 @@ export function parseRoleVerdict(text) {
         // "NEW: [major] summary | evidence" legacy fallback.
         const match = line.match(/^NEW\s*:\s*\[(low|medium|high|critical|blocker|integrity)\]\s*(.+)$/iu)
         if (!match) {
-          warnings.push(`Ignored malformed NEW line: ${line}`)
+          warn(warnings, `Ignored malformed NEW line: ${line}`)
           reportError = true
           continue
         }
         const [summary, evidence = ''] = match[2].split(/\s*\|\s*evidence\s*:\s*/iu)
-        issues.push({ severity: match[1].toLowerCase(), summary: summary.trim(), evidence: evidence.trim() })
+        addItem(issues, {
+          severity: match[1].toLowerCase(),
+          summary: clipText(summary.trim(), REPORT_ITEM_TEXT_LIMIT),
+          evidence: clipText(evidence.trim(), REPORT_ITEM_TEXT_LIMIT),
+        }, warnings, 'ISSUE')
         continue
       }
       const severity = (piped[1] ?? '').toLowerCase()
       const summary = asText(piped[2])
       const evidence = asText(piped.slice(3).join(' | '))
       if (!SEVERITIES.has(severity) || !summary || !usableEvidence(evidence)) {
-        warnings.push(`Ignored malformed ISSUE line (severity, summary, and evidence are required): ${line}`)
+        warn(warnings, `Ignored malformed ISSUE line (severity, summary, and evidence are required): ${line}`)
         reportError = true
         continue
       }
-      issues.push({ severity, summary, evidence })
+      addItem(issues, {
+        severity,
+        summary: clipText(summary, REPORT_ITEM_TEXT_LIMIT),
+        evidence: clipText(evidence, REPORT_ITEM_TEXT_LIMIT),
+      }, warnings, 'ISSUE')
       continue
     }
     if (head === 'FIXED' || head === 'STILL') {
       const parsed = parseIssueReference(line, head)
       if (!parsed) {
-        warnings.push(`Ignored malformed ${head} line: ${line}`)
+        warn(warnings, `Ignored malformed ${head} line: ${line}`)
         if (head === 'FIXED') reportError = true
         continue
       }
       if (head === 'FIXED' && !usableEvidence(parsed.evidence)) {
         // A fix without directly-checked evidence must not close anything.
-        warnings.push(`Ignored FIXED ${parsed.issueId} without usable evidence: ${line}`)
+        warn(warnings, `Ignored FIXED ${parsed.issueId} without usable evidence: ${line}`)
         continue
       }
-      ;(head === 'FIXED' ? fixed : still).push(parsed)
+      addItem(head === 'FIXED' ? fixed : still, parsed, warnings, head)
       continue
     }
     if (/^VERDICT\s*:/iu.test(line)) {
@@ -131,11 +200,11 @@ export function parseRoleVerdict(text) {
       const headColon = line.slice(0, line.indexOf(':')).toUpperCase()
       const parsed = parseIssueReference(line, headColon)
       if (!parsed) {
-        warnings.push(`Ignored malformed ${headColon} line: ${line}`)
+        warn(warnings, `Ignored malformed ${headColon} line: ${line}`)
       } else if (headColon === 'FIXED' && !usableEvidence(parsed.evidence)) {
-        warnings.push(`Ignored FIXED ${parsed.issueId} without usable evidence: ${line}`)
+        warn(warnings, `Ignored FIXED ${parsed.issueId} without usable evidence: ${line}`)
       } else {
-        (headColon === 'FIXED' ? fixed : still).push(parsed)
+        addItem(headColon === 'FIXED' ? fixed : still, parsed, warnings, headColon)
       }
       continue
     }
@@ -166,7 +235,9 @@ export function parseRoleVerdict(text) {
  */
 function lastReason(entries, verdict) {
   const matching = entries.filter(entry => entry.value === verdict && entry.reason)
-  return matching.length > 0 ? matching[matching.length - 1].reason : undefined
+  return matching.length > 0
+    ? clipText(matching[matching.length - 1].reason, REPORT_REASON_LIMIT)
+    : undefined
 }
 
 /**
@@ -231,7 +302,16 @@ export function parseAuditReport(text) {
   const phases = { a: 'fail', b: 'fail', c: 'fail' }
   const seenPhases = new Set()
   const warnings = []
-  for (const rawLine of bounded(text, 20000).split('\n')) {
+  const source = typeof text === 'string' ? text : String(text ?? '')
+  if (source.length > REPORT_SCAN_LIMIT) {
+    return {
+      verdict: 'fail',
+      reason: `Auditor report exceeds the ${REPORT_SCAN_LIMIT}-character parse limit; it cannot be accepted.`,
+      phases,
+      warnings: [`Report length ${source.length} exceeds ${REPORT_SCAN_LIMIT}; not parsed.`],
+    }
+  }
+  for (const rawLine of source.split('\n')) {
     const line = rawLine.trim()
     if (!line) continue
     const piped = line.split('|').map(part => part.trim())
@@ -239,7 +319,7 @@ export function parseAuditReport(text) {
     if (head === 'VERDICT') {
       const value = (piped[1] ?? '').toLowerCase()
       if (!VERDICTS.has(value)) {
-        warnings.push(`Ignored VERDICT line with unknown value: ${line}`)
+        warn(warnings, `Ignored VERDICT line with unknown value: ${line}`)
         continue
       }
       seenVerdicts.push({ value, reason: asText(piped.slice(2).join(' | ')) ?? '' })
@@ -249,7 +329,7 @@ export function parseAuditReport(text) {
     if (phase) {
       const key = phase[1].toLowerCase(), value = phase[2].trim().toLowerCase()
       if (seenPhases.has(key) || !['pass', 'fail'].includes(value)) {
-        warnings.push(`Ambiguous or invalid PHASE ${phase[1]}; treating it as fail.`)
+        warn(warnings, `Ambiguous or invalid PHASE ${phase[1]}; treating it as fail.`)
         phases[key] = 'fail'
       } else {
         phases[key] = value
@@ -343,6 +423,42 @@ export function isVerifier(role) {
 }
 
 /**
+ * Format the frozen campaign spec for every role prompt.  This is taken from
+ * the confirmed spec object, not from the original request, task prompt, or
+ * evidence package, so integrity restrictions and interview constraints cannot
+ * be lost to truncation.
+ *
+ * @param {object} spec
+ * @param {string} cwd
+ * @returns {string}
+ */
+function frozenSpecBlock(spec, cwd) {
+  const source = spec && typeof spec === 'object' ? spec : {}
+  const objectiveLine = typeof source.text === 'string'
+    ? source.text.split('\n').find(line => line.startsWith('Objective:')) || ''
+    : ''
+  const objective = objectiveLine.slice('Objective:'.length).trim() || 'see frozen spec'
+  const list = values => (Array.isArray(values) && values.length > 0
+    ? values.map(value => String(value).trim()).filter(Boolean).join('; ')
+    : 'none recorded')
+  const integrity = source.integrity && typeof source.integrity === 'object' ? source.integrity : {}
+  return [
+    'FROZEN CAMPAIGN SPEC (authoritative; confirmed by the human; do not weaken, narrow, or replace it)',
+    `Objective: ${objective}`,
+    `Workdir: ${String(source.workdir || cwd || '')}`,
+    `Acceptance: ${String(source.acceptance || source.confirmedCommand || '')}`,
+    `Verification command: ${String(source.confirmedCommand || 'not set')}`,
+    `Deliverables: ${list(source.deliverables)}`,
+    `Constraints: ${list(source.constraints)}`,
+    `Files: ${list(source.files)}`,
+    `Integrity mode: ${String(integrity.mode || 'not recorded')}`,
+    `Integrity selections: ${list(integrity.selected)}`,
+    `Integrity restrictions: ${list(integrity.notAllowed)}`,
+    `Standard library only: ${integrity.standardLibraryOnly ? 'yes' : 'no'}`,
+  ].join('\n')
+}
+
+/**
  * Build the per-task runtime envelope appended to the campaign's base prompt.
  *
  * @param {object} options
@@ -354,6 +470,7 @@ export function isVerifier(role) {
  * @param {string} options.taskPrompt
  * @param {string} [options.originalRequest]
  * @param {object} [options.task] - campaign task (writeScope, issueProtocol, budget).
+ * @param {object} [options.spec] - frozen campaign spec (authoritative).
  * @param {string} [options.evidence] - bounded evidence package.
  * @param {number} [options.round]
  * @returns {string}
@@ -367,6 +484,7 @@ export function buildRolePrompt({
   taskPrompt,
   originalRequest,
   task,
+  spec,
   evidence,
   round,
 }) {
@@ -392,6 +510,9 @@ export function buildRolePrompt({
   ]
   if (asText(originalRequest)) {
     lines.push('', 'ORIGINAL REQUEST (frozen at confirmation; the source of truth)', bounded(originalRequest, 6000))
+  }
+  if (spec && typeof spec === 'object') {
+    lines.push('', frozenSpecBlock(spec, cwd))
   }
   lines.push('', 'YOUR TASK', bounded(taskPrompt, 12000))
 

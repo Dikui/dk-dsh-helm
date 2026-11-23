@@ -118,6 +118,13 @@ test('installed DSH runtime: /teamwork skip → inert wrong confirm → confirme
       assert.match(view.status, /audit passed/);
       assert.match(view.status, /tasks 2\/2 passed/);
       assert.match(prompts.get('reviewer'), /Math\.min\(hi/, 'the reviewer must receive the human-selected file contents, not just a filename');
+      for (const role of ['implementer', 'reviewer', 'auditor']) {
+        const prompt = prompts.get(role);
+        assert.match(prompt, /FROZEN CAMPAIGN SPEC \(authoritative/u, `${role} receives the frozen spec`);
+        assert.match(prompt, /Constraints: Follow the confirmed original request exactly/u);
+        assert.match(prompt, /Integrity restrictions:/u);
+        assert.match(prompt, /Standard library only: no/u);
+      }
       assert.match(view.status, /open issues 0/);
       assert.match(view.status, /last acceptance: exit 0 — node accept-pass\.mjs/);
       assert.match(view.dossier, /Decision: pass; independent audit: passed/);

@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { workdirMatches } from './campaign.js'
 import { runTeamworkChild } from './host-child.js'
 import { collectTeamworkEvidence } from './host-evidence.js'
 import {
@@ -213,6 +214,7 @@ export async function executeCampaign({ ctx, handle, agent, cwd, signal, runId, 
       taskPrompt: task.prompt ?? '',
       originalRequest,
       task,
+      spec: handle.state.spec,
       evidence,
       round: handle.state.rounds?.current,
     })
@@ -312,6 +314,7 @@ export async function executeCampaign({ ctx, handle, agent, cwd, signal, runId, 
         role: task.role,
         outcome: parsed.verdict,
         verdict: parsed.verdict,
+        reason: parsed.reason,
         childSessionId: childId,
         durationMs,
         evidence: acceptance
@@ -376,6 +379,13 @@ export async function executeCampaign({ ctx, handle, agent, cwd, signal, runId, 
     const status = () => String(handle.state.status ?? '')
     const terminal = () => ['passed', 'success', 'complete', 'completed', 'cancelled', 'failed', 'stopped'].includes(status())
     if (terminal()) return finish('terminal')
+
+    if (handle.state.spec?.workdir && !workdirMatches(cwd, handle.state.spec.workdir)) {
+      return await pauseFor(
+        `This run was frozen with workdir ${handle.state.spec.workdir}, which differs from its workspace ${cwd}. `
+        + `The directory is fixed when the run is created; create a new run with @cwd ${handle.state.spec.workdir}.`,
+      )
+    }
 
     const planTasks = () => handle.state.plan?.tasks ?? []
     const statusOf = id => planTasks().find(task => task.id === id)?.status
@@ -491,7 +501,11 @@ export async function executeCampaign({ ctx, handle, agent, cwd, signal, runId, 
   }
 
   async function pauseFor(reason) {
-    await reduce({ type: 'pause', source: 'manual-chat', reason }).catch(() => {})
+    // Never overwrite the cause of an existing pause with this later, possibly
+    // secondary, reason.  The first pause remains authoritative for resume.
+    if (String(handle.state.status ?? '') !== 'paused') {
+      await reduce({ type: 'pause', source: 'manual-chat', reason }).catch(() => {})
+    }
     return { status: 'paused', summary: reason, warnings, acceptance }
   }
 

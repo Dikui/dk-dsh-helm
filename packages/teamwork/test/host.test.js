@@ -75,6 +75,87 @@ test('auditor pass requires all three phases and a veto cannot be overwritten', 
   assert.equal(vetoed.verdict, 'veto')
 })
 
+test('reviewer and audit reports are parsed in full, not from a 20k prefix', () => {
+  const padding = 'a'.repeat(25000)
+  const roleVeto = parseRoleVerdict(`${padding}\nVERDICT|pass|prefix looks fine\nVERDICT|veto|the tail veto wins`)
+  assert.equal(roleVeto.verdict, 'veto')
+  assert.equal(roleVeto.reason, 'the tail veto wins')
+
+  const roleLeadingVeto = parseRoleVerdict(`VERDICT|veto|leading veto\n${padding}\nVERDICT|pass|ok`)
+  assert.equal(roleLeadingVeto.verdict, 'veto')
+
+  const auditVeto = parseAuditReport([
+    'PHASE A|pass|trace checked', 'PHASE B|pass|no edits', 'PHASE C|pass|receipt',
+    padding, 'VERDICT|pass|prefix ok', 'VERDICT|veto|tail audit veto',
+  ].join('\n'))
+  assert.equal(auditVeto.verdict, 'veto')
+  assert.deepEqual(auditVeto.phases, { a: 'pass', b: 'pass', c: 'pass' })
+
+  const auditPrefix = parseAuditReport([
+    'VERDICT|pass|ok', 'PHASE A|pass|a', 'PHASE B|pass|b', 'PHASE C|pass|c', padding,
+  ].join('\n'))
+  assert.equal(auditPrefix.verdict, 'pass')
+})
+
+test('oversized reports fail closed instead of being truncated and accepted', () => {
+  const oversized = 'x'.repeat(512 * 1024 + 1)
+  const role = parseRoleVerdict(`${oversized}\nVERDICT|pass|ok`)
+  assert.equal(role.verdict, 'fail')
+  assert.match(role.reason, /exceeds the .* parse limit/u)
+  assert.ok(role.warnings.some(warning => /not parsed/u.test(warning)))
+
+  const audit = parseAuditReport(`${oversized}\nVERDICT|pass|ok\nPHASE A|pass\nPHASE B|pass\nPHASE C|pass`)
+  assert.equal(audit.verdict, 'fail')
+  assert.match(audit.reason, /exceeds the .* parse limit/u)
+})
+
+test('report storage is bounded without losing the verdict', () => {
+  const longSummary = 's'.repeat(1000)
+  const lines = ['VERDICT|pass|ok']
+  for (let i = 0; i < 300; i += 1) lines.push(`ISSUE|low|${longSummary}|src/a.js:${i}`)
+  const report = parseRoleVerdict(lines.join('\n'))
+  assert.equal(report.verdict, 'pass')
+  assert.equal(report.issues.length, 200)
+  assert.ok(report.issues[0].summary.length < 600)
+  assert.ok(report.warnings.some(warning => /additional ISSUE entries after 200/u.test(warning)))
+
+  const malformed = ['VERDICT|pass|ok']
+  for (let i = 0; i < 100; i += 1) malformed.push(`ISSUE|bogus|bad|src/a.js:${i}`)
+  const boundedWarnings = parseRoleVerdict(malformed.join('\n'))
+  assert.ok(boundedWarnings.warnings.length <= 51)
+  assert.ok(boundedWarnings.warnings.some(warning => /Additional warnings omitted/u.test(warning)))
+})
+
+test('the frozen spec reaches execution, review, and audit prompts as authoritative data', () => {
+  const spec = {
+    text: 'Objective: Build the ledger\nWorkdir: /tmp/work',
+    workdir: '/tmp/work',
+    acceptance: 'npm test',
+    confirmedCommand: 'npm test',
+    deliverables: ['src/ledger.js', 'tests'],
+    constraints: ['Node 22', 'no dependencies'],
+    files: ['src/ledger.js'],
+    integrity: {
+      mode: 'benchmark',
+      selected: ['a', 'b', 'c', 'd'],
+      notAllowed: ['dependencies outside the standard library', 'hardcoded acceptance output'],
+      standardLibraryOnly: true,
+    },
+  }
+  for (const role of ['implementer', 'reviewer', 'auditor', 'explorer']) {
+    const prompt = buildRolePrompt({
+      role, taskId: `${role}-1`, mode: 'general', runId: 'tw-abc-123456',
+      cwd: '/tmp/work', taskPrompt: 'Do the task.', spec,
+    })
+    assert.match(prompt, /FROZEN CAMPAIGN SPEC \(authoritative/u)
+    assert.match(prompt, /Integrity restrictions: dependencies outside the standard library; hardcoded acceptance output/u)
+    assert.match(prompt, /Standard library only: yes/u)
+    assert.match(prompt, /Constraints: Node 22; no dependencies/u)
+    assert.match(prompt, /Deliverables: src\/ledger\.js; tests/u)
+    assert.match(prompt, /Verification command: npm test/u)
+  }
+})
+
 test('role prompt states one enum word and never leaks the acceptance command to verifiers', () => {
   const reviewer = buildRolePrompt({
     role: 'reviewer',
@@ -318,6 +399,116 @@ test('command: no child before the human-typed confirm line, and a wrong line is
   assert.equal(confirmed.kind, 'success', confirmed.text)
   assert.equal(harness.children.length, 3, 'implementer, reviewer and fresh auditor run')
   assert.match(confirmed.text, /Victory audit: passed/u)
+})
+
+test('command: an answer cannot move the draft workdir to another directory', async () => {
+  const answers = {
+    objective: 'Build a ledger',
+    users: 'maintainers',
+    restrictions: 'e',
+    deliverables: 'src/ledger.js',
+    constraints: 'no dependencies',
+    acceptance: 'node -e "process.exit(0)"',
+    route: 'swe-light',
+  }
+  const state = campaignModule.createCampaignState({
+    mode: 'swe-light',
+    cwd: '/tmp/teamwork-command',
+    rootSessionId: 'root-session',
+    runId: 'tw-seed-aaaaaa',
+    confirmedCommand: 'node -e "process.exit(0)"',
+    skipInterview: false,
+    answers,
+  })
+  assert.equal(state.status, 'draft')
+  const harness = commandHarness({ storageDomain: memoryStorageDomain({ [state.runId]: state }) })
+
+  const rejected = await harness.call(`answer ${state.runId} workdir /tmp/other`)
+  assert.equal(rejected.kind, 'error', rejected.text)
+  assert.match(rejected.text, /WORKDIR_MISMATCH|@cwd \/tmp\/other|No answer accepted/u)
+  assert.equal(harness.children.length, 0)
+
+  const accepted = await harness.call(`answer ${state.runId} workdir /tmp/teamwork-link`)
+  assert.equal(accepted.kind, 'success', accepted.text)
+  assert.match(accepted.text, /Workdir: \/tmp\/teamwork-command/u)
+  assert.ok(!/Workdir: \/tmp\/teamwork-link/u.test(accepted.text))
+  assert.equal(harness.children.length, 0, 'answering never starts a child')
+  await harness.dispose()
+})
+
+test('command: confirmation rejects a legacy draft workdir mismatch before any child starts', async () => {
+  const state = campaignModule.createCampaignState({
+    mode: 'swe-light',
+    cwd: '/tmp/teamwork-command',
+    rootSessionId: 'root-session',
+    runId: 'tw-seed-bbbbbb',
+    confirmedCommand: 'node -e "process.exit(0)"',
+    skipInterview: true,
+    answers: {
+      objective: 'Build a ledger', users: 'maintainers', restrictions: 'e',
+      deliverables: 'src/ledger.js', constraints: 'no dependencies',
+      acceptance: 'node -e "process.exit(0)"', route: 'swe-light',
+      workdir: '/tmp/teamwork-command',
+    },
+  })
+  const draft = state.interview.draft
+  const moved = {
+    ...state,
+    interview: {
+      ...state.interview,
+      answers: { ...state.interview.answers, workdir: '/tmp/other' },
+      draft: { ...draft, workdir: '/tmp/other' },
+    },
+  }
+  const harness = commandHarness({ storageDomain: memoryStorageDomain({ [state.runId]: moved }) })
+
+  const rejected = await harness.call(draft.confirmLine)
+  assert.equal(rejected.kind, 'error', rejected.text)
+  assert.match(rejected.text, /WORKDIR_MISMATCH/u)
+  assert.match(rejected.text, /@cwd \/tmp\/other/u)
+  assert.equal(harness.children.length, 0, 'a legacy mismatch must not start a child')
+  await harness.dispose()
+})
+
+test('command: a legacy draft spelled with an equivalent workdir confirms in the frozen cwd', async () => {
+  const state = campaignModule.createCampaignState({
+    mode: 'swe-light',
+    cwd: '/tmp/teamwork-command',
+    rootSessionId: 'root-session',
+    runId: 'tw-seed-cccccc',
+    confirmedCommand: 'node -e "process.exit(0)"',
+    skipInterview: true,
+    answers: {
+      objective: 'Build a ledger', users: 'maintainers', restrictions: 'e',
+      deliverables: 'src/ledger.js', constraints: 'no dependencies',
+      acceptance: 'node -e "process.exit(0)"', route: 'swe-light',
+      workdir: '/tmp/teamwork-command',
+    },
+  })
+  const draft = state.interview.draft
+  const aliased = {
+    ...state,
+    interview: {
+      ...state.interview,
+      answers: { ...state.interview.answers, workdir: '/tmp/teamwork-link' },
+      draft: { ...draft, workdir: '/tmp/teamwork-link', answers: { ...draft.answers, workdir: '/tmp/teamwork-link' } },
+    },
+    spec: { ...state.spec, workdir: '/tmp/teamwork-link' },
+  }
+  const harness = commandHarness({ storageDomain: memoryStorageDomain({ [state.runId]: aliased }) })
+
+  const normalized = await harness.call(draft.confirmLine)
+  assert.equal(normalized.kind, 'error', normalized.text)
+  assert.match(normalized.text, /Draft normalized/u)
+  assert.match(normalized.text, /creation-time workspace \/tmp\/teamwork-command/u)
+  assert.equal(harness.children.length, 0, 'the old token must not start a child')
+  const canonicalLine = normalized.text.match(/\/teamwork (confirm [^\n]+)/u)?.[1]
+  assert.ok(canonicalLine, 'the normalized confirmation line must be shown')
+
+  const confirmed = await harness.call(canonicalLine)
+  assert.equal(confirmed.kind, 'success', confirmed.text)
+  assert.equal(harness.children.length, 3)
+  await harness.dispose()
 })
 
 test('command: same cwd is mutually exclusive while a run is non-terminal', async () => {

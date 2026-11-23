@@ -4,6 +4,7 @@
 // effect is the optional local store used by createCampaign/loadCampaign.
 
 import { createHash } from 'node:crypto';
+import { resolve as resolvePath } from 'node:path';
 import {
   INTERVIEW_STEPS,
   REQUIRED_INTERVIEW_KEYS,
@@ -73,6 +74,27 @@ function nowOf(value) {
 function textOf(value, limit = PROMPT_LIMIT) {
   if (value === undefined || value === null) return '';
   return String(value).replace(/\u0000/g, '').trim().slice(0, limit);
+}
+
+function normalizeDirectory(value, base) {
+  const raw = textOf(value, 4096);
+  if (!raw) return '';
+  let resolved = resolvePath(base || process.cwd(), raw);
+  if (resolved.length > 1) resolved = resolved.replace(/[\\/]+$/u, '');
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+export function workdirMatches(cwd, value) {
+  const base = textOf(cwd, 4096) || process.cwd();
+  const requested = textOf(value, 4096);
+  if (!requested) return false;
+  return normalizeDirectory(requested, base) === normalizeDirectory(base, base);
+}
+
+function workdirMismatchReason(cwd, value) {
+  const base = textOf(cwd, 4096) || process.cwd();
+  const requested = textOf(value, 4096) || '(empty)';
+  return `workdir ${requested} resolves outside campaign workspace ${base}. The workdir is fixed when the run is created; create a new run with @cwd ${requested} instead.`;
 }
 
 function clone(value) {
@@ -223,6 +245,8 @@ function specPrompt(state) {
     `Objective: ${objective}`,
     `Route: ${s.routeSignals.route || state.route}`,
     `Integrity mode: ${s.integrity.mode}`,
+    `Integrity restrictions: ${s.integrity.notAllowed?.length ? s.integrity.notAllowed.join('; ') : 'none recorded'}`,
+    `Standard library only: ${s.integrity.standardLibraryOnly ? 'yes' : 'no'}`,
     `Deliverables: ${s.deliverables.length ? s.deliverables.join('; ') : 'see frozen spec'}`,
     `Constraints: ${s.constraints.length ? s.constraints.join('; ') : 'none recorded'}`,
     `Files: ${s.files?.length ? s.files.join('; ') : 'none'}`,
@@ -670,6 +694,9 @@ function applyConfirmation(state, event, at) {
   if (event.command && textOf(event.command, 4096) !== textOf(draft.confirmedCommand, 4096)) {
     return { result: fail('COMMAND_MISMATCH', 'confirmation command does not match the frozen draft') };
   }
+  if (!workdirMatches(state.cwd, draft.workdir)) {
+    return { result: fail('WORKDIR_MISMATCH', workdirMismatchReason(state.cwd, draft.workdir)) };
+  }
 
   const answers = draft.answers || {};
   state.route = draft.route;
@@ -690,7 +717,7 @@ function applyConfirmation(state, event, at) {
     constraints: [...draft.constraints],
     deliverables: [...draft.deliverables],
     acceptance: draft.acceptance,
-    workdir: draft.workdir,
+    workdir: state.cwd,
     files: [...(draft.files || state.spec.files || [])],
     routeSignals: {
       route: draft.route,
@@ -754,12 +781,18 @@ function applyInterviewAnswer(state, event, at) {
       rejected.push({ key: step.key, reason: valid.reason });
       continue;
     }
-    state.interview.answers[step.key] = normalizeAnswer(step, value);
+    if (step.key === 'workdir' && !workdirMatches(state.cwd, value)) {
+      rejected.push({ key: step.key, reason: workdirMismatchReason(state.cwd, value) });
+      continue;
+    }
+    state.interview.answers[step.key] = step.key === 'workdir'
+      ? state.cwd
+      : normalizeAnswer(step, value);
     accepted.push(step.key);
   }
 
   if (!accepted.length) {
-    return { result: fail('INVALID_ANSWER', 'no answer was accepted') };
+    return { result: fail('INVALID_ANSWER', rejected.map(r => r.reason).join('; ') || 'no answer was accepted') };
   }
 
   state.interview.step = interviewStepIndex(state.interview.answers);
@@ -1155,6 +1188,9 @@ function auditResult(state, event, at) {
 function resumeCampaign(state, event, at) {
   if (event.source !== 'manual-chat') return { result: fail('NOT_MANUAL', 'resume must come from manual chat') };
   if (state.status !== 'paused') return { result: fail('WRONG_STATUS', `campaign is ${state.status}`) };
+  if (state.spec.workdir && !workdirMatches(state.cwd, state.spec.workdir)) {
+    return { result: fail('WORKDIR_MISMATCH', workdirMismatchReason(state.cwd, state.spec.workdir)) };
+  }
   const resumeAudit = state.audit.status === 'pending' && state.plan.tasks.length > 0 && state.plan.tasks.every(task => task.status === 'pass');
   state.status = resumeAudit ? 'verifying' : 'running';
   state.failure = null;
@@ -1312,6 +1348,11 @@ export function createCampaignState(input = {}) {
     if (!built.ok) {
       throw new Error(`INTERVIEW_INVALID: ${built.errors.map(e => e.reason).join('; ')}`);
     }
+    if (!workdirMatches(cwd, built.draft.workdir)) {
+      throw new Error(`WORKDIR_MISMATCH: ${workdirMismatchReason(cwd, built.draft.workdir)}`);
+    }
+    built.draft.workdir = cwd;
+    built.draft.answers = { ...built.draft.answers, workdir: cwd };
     state.interview.answers = { ...built.draft.answers };
     state.interview.skipped = true;
     state.interview.step = 9;
@@ -1336,7 +1377,12 @@ function applyInterviewAnswersToState(state, answers, at) {
     if (!step || step.key === 'draft') continue;
     const valid = validateAnswer(step, value);
     if (!valid.ok) return { ok: false, reason: valid.reason };
-    state.interview.answers[step.key] = normalizeAnswer(step, value);
+    if (step.key === 'workdir' && !workdirMatches(state.cwd, value)) {
+      return { ok: false, reason: `WORKDIR_MISMATCH: ${workdirMismatchReason(state.cwd, value)}` };
+    }
+    state.interview.answers[step.key] = step.key === 'workdir'
+      ? state.cwd
+      : normalizeAnswer(step, value);
   }
   state.interview.step = interviewStepIndex(state.interview.answers);
   if (REQUIRED_INTERVIEW_KEYS.every(k => textOf(state.interview.answers[k]))) {
@@ -1407,7 +1453,10 @@ export function reduceEvent(state, event = {}, opts = {}) {
       });
       if (!built.ok) {
         outcome = { result: fail('DRAFT_INVALID', built.errors.map(e => e.reason).join('; ')) };
+      } else if (!workdirMatches(next.cwd, built.draft.workdir)) {
+        outcome = { result: fail('WORKDIR_MISMATCH', workdirMismatchReason(next.cwd, built.draft.workdir)) };
       } else {
+        built.draft.workdir = next.cwd;
         next.interview.draft = built.draft;
         next.interview.step = 9;
         next.status = 'awaiting-confirm';
@@ -1465,8 +1514,17 @@ export function reduceEvent(state, event = {}, opts = {}) {
         outcome = { result: fail('NOT_MANUAL', 'pause must come from manual chat') };
       } else if (!['running', 'verifying', 'paused'].includes(next.status)) {
         outcome = { result: fail('WRONG_STATUS', `campaign is ${next.status}`) };
+      } else if (next.status === 'paused') {
+        outcome = {
+          result: ok({
+            code: 'ALREADY_PAUSED',
+            reason: next.failure?.reason || 'campaign is already paused',
+          }),
+          effects: [],
+        };
       } else {
-        const effects = pauseCampaign(next, at, 'MANUAL_PAUSE', 'paused from manual chat');
+        const reason = textOf(event.reason, 1024) || 'paused from manual chat';
+        const effects = pauseCampaign(next, at, 'MANUAL_PAUSE', reason);
         outcome = { result: ok(), effects };
       }
       break;
@@ -1602,6 +1660,9 @@ export function validateConfirmation(state, confirmation = {}) {
   }
   if (String(confirmation.token ?? '') !== draft.token) {
     return fail('STALE_TOKEN', 'draft token is no longer current');
+  }
+  if (!workdirMatches(state.cwd, draft.workdir)) {
+    return fail('WORKDIR_MISMATCH', workdirMismatchReason(state.cwd, draft.workdir));
   }
   return ok();
 }

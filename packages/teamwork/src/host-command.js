@@ -8,6 +8,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { resolve as resolvePath } from 'node:path'
 import { parseTeamworkInput, matchesConfirmLine, isValidRunId, USAGE } from './host-input.js'
 import { executeCampaign } from './host-runner.js'
 import { bounded } from './host-text.js'
@@ -235,6 +236,31 @@ export function apply(ctx, modules) {
     const key = String(target?.targetKey ?? cwd).replace(/[\\/]+$/u, '') || cwd
     return { cwd, key }
   }
+
+  // Compare a user-supplied directory with the campaign's creation-time cwd.
+  // Both the filesystem identity and the normalized host path are considered,
+  // so an alias of the same directory is accepted and normalized, while a
+  // genuinely different directory is rejected before any state mutation.
+  const sameWorkspaceDirectory = async (requested, base, signal) => {
+    const target = await ctx.fs.resolve(requested, { cwd: base, signal })
+    const requestedPath = ctx.fs.processPath(target)
+    const requestedKey = String(target?.targetKey ?? requestedPath).replace(/[\\/]+$/u, '') || requestedPath
+    const anchorTarget = await ctx.fs.resolve(base, { cwd: base, signal })
+    const anchorPath = ctx.fs.processPath(anchorTarget)
+    const anchorKey = String(anchorTarget?.targetKey ?? anchorPath).replace(/[\\/]+$/u, '') || anchorPath
+    if (requestedKey === anchorKey) return true
+    const normalize = value => {
+      let resolved = resolvePath(value)
+      if (resolved.length > 1) resolved = resolved.replace(/[\\/]+$/u, '')
+      return process.platform === 'win32' ? resolved.toLowerCase() : resolved
+    }
+    return normalize(requestedPath) === normalize(anchorPath)
+  }
+
+  const workdirRejectedText = (raw, cwd) => (
+    `workdir ${raw} is outside this run's workspace ${cwd}. `
+    + `The directory is fixed when the run is created; create a new run with @cwd ${raw} instead.`
+  )
 
   const startClaim = keys => {
     const wanted = [...new Set(keys.filter(Boolean))]
@@ -509,9 +535,24 @@ export function apply(ctx, modules) {
         const resolved = await resolveRun(mods, invocation, parsed.runId)
         if (resolved.error) return bad(resolved.error)
         const handle = resolved.handle
+        const values = { ...(parsed.values ?? {}) }
+        if (Object.prototype.hasOwnProperty.call(values, 'workdir')
+          && String(values.workdir ?? '').trim() !== '') {
+          const raw = String(values.workdir).trim()
+          let same = false
+          try {
+            same = await sameWorkspaceDirectory(raw, handle.state.cwd, signalFor(invocation))
+          } catch (error) {
+            return bad(`Answer rejected (WORKDIR_UNRESOLVED): ${error instanceof Error ? error.message : String(error)}\nNo answer accepted; the draft is unchanged.`)
+          }
+          if (!same) {
+            return bad(`Answer rejected (WORKDIR_MISMATCH): ${workdirRejectedText(raw, handle.state.cwd)}\nNo answer accepted; the draft is unchanged.`)
+          }
+          values.workdir = handle.state.cwd
+        }
         const result = await handle.reduce({
           type: 'interview-answer',
-          values: parsed.values,
+          values,
           expectedRevision: handle.state.revision,
         })
         const out = result?.result ?? result ?? {}
@@ -546,11 +587,52 @@ export function apply(ctx, modules) {
           if (!matchesConfirmLine(parsed.text, state.interview.draft.confirmLine)) {
             return bad(`Confirmation does not match. Type the draft line exactly, token included:\n/teamwork ${state.interview.draft.confirmLine}\nNo child started.`)
           }
+          const draft = state.interview.draft
+          const draftWorkdir = String(draft.workdir ?? '').trim()
+          if (!draftWorkdir) {
+            return bad(`Confirmation rejected (WORKDIR_MISMATCH): the draft has no workdir. Create a new run with @cwd ${state.cwd}.\nNo child started.`)
+          }
+          let sameWorkdir = false
+          try {
+            sameWorkdir = await sameWorkspaceDirectory(draftWorkdir, state.cwd, signalFor(invocation))
+          } catch (error) {
+            return bad(`Confirmation rejected (WORKDIR_UNRESOLVED): ${error instanceof Error ? error.message : String(error)}\nNo child started.`)
+          }
+          if (!sameWorkdir) {
+            return bad(`Confirmation rejected (WORKDIR_MISMATCH): ${workdirRejectedText(draftWorkdir, state.cwd)}\nNo child started.`)
+          }
+          if (draft.workdir !== state.cwd) {
+            // Older drafts may spell an equivalent directory differently
+            // (symlink, trailing slash, casing).  Persist the canonical
+            // creation-time cwd through the reducer and require the human to
+            // type the rebuilt line: the old token commits to the old spelling,
+            // so silently starting from it would execute a spec the human did
+            // not see.
+            const normalized = await handle.reduce({
+              type: 'interview-answer',
+              values: { workdir: state.cwd },
+              expectedRevision: state.revision,
+            })
+            const applied = normalized?.result ?? normalized ?? {}
+            if (applied.ok === false) {
+              return bad(`Confirmation rejected (${applied.code ?? 'INVALID'}): ${applied.reason ?? 'no reason'}\nNo child started.`)
+            }
+            const nextDraft = handle.state.interview?.draft
+            if (!nextDraft) {
+              return bad('Confirmation rejected (WORKDIR_MISMATCH): the normalized draft is unavailable. No child started.')
+            }
+            return bad([
+              `Draft normalized from ${draftWorkdir} to the creation-time workspace ${state.cwd}.`,
+              'The old line is no longer current. Type the rebuilt line exactly:',
+              `/teamwork ${nextDraft.confirmLine}`,
+              'No child started.',
+            ].join('\n'))
+          }
           const result = await handle.reduce({
             type: 'confirm',
-            text: state.interview.draft.confirmLine,
-            token: state.interview.draft.token,
-            version: state.interview.draft.version,
+            text: draft.confirmLine,
+            token: draft.token,
+            version: draft.version,
             source: 'manual-chat',
             expectedRevision: state.revision,
           })
