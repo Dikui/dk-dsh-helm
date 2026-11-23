@@ -77,6 +77,24 @@ function textOf(value, limit = PROMPT_LIMIT) {
   return String(value).replace(/\u0000/g, '').trim().slice(0, limit);
 }
 
+// Bounded display text that keeps both ends, so the changing suffix of a long
+// failure reason remains visible in round history and retry briefs.
+function middleText(value, limit) {
+  const text = String(value ?? '').replace(/\u0000/g, '').trim();
+  if (text.length <= limit) return text;
+  const head = Math.max(0, Math.floor(limit / 2) - 20);
+  const tail = Math.max(0, limit - head - 40);
+  return `${text.slice(0, head)}…[omitted ${text.length - head - tail} characters]…${text.slice(-tail)}`;
+}
+
+// Identity for repeated-failure detection is derived from the full cause. It
+// must never be derived from display-clipped text, where two different reasons
+// can share an identical prefix.
+function reasonDigest(value) {
+  const text = String(value ?? '').replace(/\u0000/g, '').trim();
+  return text ? createHash('sha256').update(text).digest('hex') : null;
+}
+
 function normalizeDirectory(value, base) {
   const raw = textOf(value, 4096);
   if (!raw) return '';
@@ -309,6 +327,7 @@ function taskRecord({
     finishedAt: null,
     outcome: null,
     failureReason: null,
+    failureIdentity: null,
   };
 }
 
@@ -509,7 +528,7 @@ function startNextRound(state, at, failureTasks, source = 'gate') {
     : source === 'issues'
       ? `issues:${state.ledger.open.map(i => i.id).sort().join(',')}`
       : JSON.stringify(failureTasks
-        .map(t => `${t.role}:${t.outcome || 'fail'}:${t.failureReason || ''}`)
+        .map(t => `${t.role}:${t.outcome || 'fail'}:${t.failureIdentity || t.failureReason || ''}`)
         .sort());
   if (source === 'issues') {
     // An unresolved issue is a deliberate retry, not an oscillation.  It still
@@ -538,7 +557,7 @@ function startNextRound(state, at, failureTasks, source = 'gate') {
     round: failedRound,
     at,
     signature,
-    failed: failureTasks.map(t => ({ id: t.id, role: t.role, reason: textOf(t.failureReason, 512) })),
+    failed: failureTasks.map(t => ({ id: t.id, role: t.role, reason: middleText(t.failureReason, 512) })),
     openIssues: state.ledger.open.length,
   });
   if (state.rounds.history.length > state.rounds.max) {
@@ -944,7 +963,10 @@ function roleResult(state, event, at) {
 
   task.finishedAt = at;
   task.outcome = outcome;
-  task.failureReason = textOf(verdict.reason || event.reason, 2048);
+  const failureCause = verdict.reason || event.reason;
+  task.failureReason = middleText(failureCause, 2048);
+  task.failureIdentity = textOf(verdict.reasonDigest || event.reasonDigest, 64)
+    || reasonDigest(failureCause);
   if (event.report) task.report = textOf(event.report, 1600);
 
   if (event.evidence) {

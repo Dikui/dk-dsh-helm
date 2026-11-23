@@ -26,6 +26,7 @@ import {
   validateInterviewAnswer,
 } from '../src/interview.js';
 import { buildRetryBrief } from '../src/host-runner.js';
+import { parseRoleVerdict } from '../src/host-text.js';
 import { createMemoryStore } from './support/memory-store.js';
 
 const NOW = Date.UTC(2026, 0, 1, 0, 0, 0);
@@ -121,6 +122,22 @@ function failReview(state, round, reason) {
     childSessionId: `rev-${round}`, outcome: 'fail', verdict: 'fail', reason,
   });
   assert.equal(r.result.ok, true, `review fail ${round} failed: ${r.result.code}`);
+  return r;
+}
+
+// Mirrors the host runner's parsed-verdict path, including the digest of the
+// complete reason (not the display-clipped text).
+function failParsedReview(state, round, reason) {
+  let s = completeSweRound(state, round);
+  const parsed = parseRoleVerdict(`VERDICT|fail|${reason}`);
+  assert.equal(parsed.verdict, 'fail');
+  assert.equal(parsed.reasonDigest.length, 64);
+  const r = step(s, {
+    type: 'role-result', taskId: `review-r${round}`, role: 'reviewer',
+    childSessionId: `rev-${round}`, outcome: 'fail', verdict: parsed.verdict,
+    reason: parsed.reason, reasonDigest: parsed.reasonDigest,
+  });
+  assert.equal(r.result.ok, true, `parsed review fail ${round} failed: ${r.result.code}`);
   return r;
 }
 
@@ -907,6 +924,43 @@ test('verifier reasons that differ after a long shared prefix still do not oscil
   assert.equal(r.state.rounds.current, 3);
   assert.equal(r.state.rounds.consecutiveFailures, 1);
   assert.ok(!r.effects.includes('pause'));
+});
+
+test('verifier reasons over the display limit keep distinct identities', () => {
+  const prefix = 'the same leading explanation '.repeat(80);
+  const reasonA = `${prefix}fix output +`;
+  const reasonB = `${prefix}fix output -`;
+  assert.equal(reasonA.length, reasonB.length);
+  assert.ok(reasonA.length > 2000);
+  const parsedA = parseRoleVerdict(`VERDICT|fail|${reasonA}`);
+  const parsedB = parseRoleVerdict(`VERDICT|fail|${reasonB}`);
+  assert.match(parsedA.reason, /…\[omitted \d+ characters\]…/u);
+  assert.match(parsedA.reason, /fix output \+$/u);
+  assert.match(parsedB.reason, /fix output -$/u);
+  assert.notEqual(parsedA.reasonDigest, parsedB.reasonDigest);
+
+  let state = confirmedState({ maxRounds: 5 });
+  state = failParsedReview(state, 1, reasonA).state;
+  const recorded = state.rounds.history.at(-1).failed[0].reason;
+  assert.match(recorded, /…\[omitted \d+ characters\]…/u);
+  assert.match(recorded, /fix output \+$/u);
+  assert.match(buildRetryBrief(state), /fix output \+$/mu);
+
+  const r = failParsedReview(state, 2, reasonB);
+  assert.equal(r.state.status, 'running');
+  assert.equal(r.state.rounds.current, 3);
+  assert.equal(r.state.rounds.consecutiveFailures, 1);
+  assert.ok(!r.effects.includes('pause'));
+});
+
+test('identical verifier reasons beyond the display limit still trip the oscillation guard', () => {
+  const reason = `${'B'.repeat(2100)}same trailing cause`;
+  let state = confirmedState({ maxRounds: 5 });
+  state = failParsedReview(state, 1, reason).state;
+  const r = failParsedReview(state, 2, reason);
+  assert.equal(r.state.status, 'paused');
+  assert.equal(r.state.failure.code, 'OSCILLATION');
+  assert.ok(r.effects.includes('pause'));
 });
 
 test('the same verifier reason still trips the oscillation guard', () => {

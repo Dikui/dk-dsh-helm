@@ -9,6 +9,7 @@
  * failed verification, never an implicit pass.
  */
 
+import { createHash } from 'node:crypto'
 import { formatFrozenSpec } from './frozen-spec.js'
 
 const VERDICTS = new Set(['pass', 'fail', 'veto'])
@@ -31,6 +32,34 @@ const REPORT_ITEM_TEXT_LIMIT = 500
 function clipText(value, max) {
   const text = String(value ?? '')
   return text.length <= max ? text : `${text.slice(0, max)}…[clipped ${text.length - max} characters]`
+}
+
+/**
+ * Bounded display text that keeps both ends. A reason's distinguishing detail
+ * is often at the end, so head-only truncation makes different causes look the
+ * same to the human reading the retry brief.
+ * @param {string} value
+ * @param {number} max
+ * @returns {string}
+ */
+function clipMiddle(value, max) {
+  const text = String(value ?? '')
+  if (text.length <= max) return text
+  const head = Math.max(0, Math.floor(max / 2) - 20)
+  const tail = Math.max(0, max - head - 40)
+  return `${text.slice(0, head)}…[omitted ${text.length - head - tail} characters]…${text.slice(-tail)}`
+}
+
+/**
+ * Stable, bounded identity for a full verdict reason. Display clipping must not
+ * be used for repeated-failure detection: two distinct reasons can share the
+ * same displayed prefix.
+ * @param {string} value
+ * @returns {string|null}
+ */
+function digestReason(value) {
+  const text = String(value ?? '')
+  return text ? createHash('sha256').update(text).digest('hex') : null
 }
 
 /**
@@ -90,7 +119,7 @@ function asText(value) {
  * that prefer the older colon form, but a missing verdict is a failure.
  *
  * @param {string} text
- * @returns {{verdict: 'pass'|'fail'|'veto', reason: string, issues: object[], fixed: object[], still: object[], warnings: string[]}}
+ * @returns {{verdict: 'pass'|'fail'|'veto', reason: string, reasonDigest: string|null, issues: object[], fixed: object[], still: object[], warnings: string[]}}
  */
 export function parseRoleVerdict(text) {
   const warnings = []
@@ -106,6 +135,7 @@ export function parseRoleVerdict(text) {
     return {
       verdict: 'fail',
       reason: `Reviewer report exceeds the ${REPORT_SCAN_LIMIT}-character parse limit; it cannot be accepted.`,
+      reasonDigest: null,
       issues,
       fixed,
       still,
@@ -200,20 +230,22 @@ export function parseRoleVerdict(text) {
 
   const verdict = resolveVerdict(seenVerdicts.map(entry => entry.value), warnings)
   if (verdict === undefined) {
-    return { verdict: 'fail', reason: 'Reviewer did not state a VERDICT line.', issues, fixed, still, warnings }
+    return { verdict: 'fail', reason: 'Reviewer did not state a VERDICT line.', reasonDigest: null, issues, fixed, still, warnings }
   }
-  reason = lastReason(seenVerdicts, verdict) ?? ''
+  const deciding = lastReason(seenVerdicts, verdict) ?? ''
+  reason = deciding ? clipMiddle(deciding, REPORT_REASON_LIMIT) : ''
   if (reportError && verdict === 'pass') {
     return {
       verdict: 'fail',
       reason: 'Reviewer report contained malformed issue/fix lines; a pass cannot be trusted.',
+      reasonDigest: null,
       issues,
       fixed,
       still,
       warnings,
     }
   }
-  return { verdict, reason, issues, fixed, still, warnings }
+  return { verdict, reason, reasonDigest: digestReason(deciding), issues, fixed, still, warnings }
 }
 
 /**
@@ -223,9 +255,7 @@ export function parseRoleVerdict(text) {
  */
 function lastReason(entries, verdict) {
   const matching = entries.filter(entry => entry.value === verdict && entry.reason)
-  return matching.length > 0
-    ? clipText(matching[matching.length - 1].reason, REPORT_REASON_LIMIT)
-    : undefined
+  return matching.length > 0 ? matching[matching.length - 1].reason : undefined
 }
 
 /**
