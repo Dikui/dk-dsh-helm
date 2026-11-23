@@ -1,6 +1,6 @@
 # dk-dsh-helm
 
-三个可独立安装的 DeepSeek Harness 多代理协作插件，面向 DSH `0.2.2-rc.5`。
+Boost、Swarm 和 Teamwork 共用[仓库版本号](VERSION)，统一发版，可按需单独安装。三个插件均面向 DSH `0.2.2-rc.5`。
 
 | 插件 | 适用场景 |
 | --- | --- |
