@@ -28,7 +28,7 @@ test('installed DSH runtime: command → worker → failing boundary check → b
   const logs = [], parent = {id:'root',session:{append(...args){logs.push(args);}}};
   const roles = {worker:{},reviewer:{}};
   const marker = 'impl-report: all boundary cases covered';
-  const events = []; let mode = 'negative'; let postExecute = 'pass';
+  const events = []; let mode = 'negative'; let postExecute = 'pass'; let reviewerFailure = false;
   const signal = new AbortController().signal;
   function invoke(agent, name, args) {
     return ctx.tools.execute({agent, signal, calls:[{type:'tool-call',id:'test',name,arguments:JSON.stringify(args)}]})
@@ -51,6 +51,7 @@ test('installed DSH runtime: command → worker → failing boundary check → b
       if (postExecute === 'block') {
         assert.equal(res.isError, true, JSON.stringify(res));
         assert.match(res.content[0].text, /blocked by post-execute policy/);
+        if (reviewerFailure) throw new Error('reviewer stopped after the blocked reveal');
         return 'The report was blocked; I cannot compare.';
       }
       if (postExecute === 'replace') {
@@ -61,6 +62,7 @@ test('installed DSH runtime: command → worker → failing boundary check → b
       }
       assert.equal(res.value, marker, JSON.stringify(res));
       assert.equal((await invoke(agent,'boost_reveal',{initialVerdict:'overwrite'})).isError, true);
+      if (reviewerFailure) throw new Error('reviewer stopped after reading the report');
       return 'Disagree: the real negative boundary test failed.';
     };
     return { childId:spec.childId, dispose:async()=>{}, result:task().then(text=>({stopReason:'completed',output:[{type:'text',text}]})) };
@@ -128,9 +130,36 @@ test('installed DSH runtime: command → worker → failing boundary check → b
     events.length=0; postExecute='replace';
     incomplete(await run(), /\(delivery: content-mismatch\)/);
     assert.deepEqual(events,['worker','check','reviewer']);
-    postExecute='pass';
 
-    assert.deepEqual(logs.map(x=>x[0]), ['command/run','command/done','command/run','command/done','command/run','command/done','command/run','command/done']);
+    // A blocked reveal followed by a reviewer failure must still surface the
+    // locked verdict instead of losing it to the thrown error.
+    events.length=0; postExecute='block'; reviewerFailure=true;
+    const crashed=await run();
+    assert.equal(crashed.kind,'error',crashed.text);
+    assert.match(crashed.text,/reviewer stopped after the blocked reveal/);
+    assert.match(crashed.text,/Initial verdict \(locked; delivery of the worker report was not confirmed\)/);
+    assert.match(crashed.text,/Boundary fails at -1/);
+    assert.match(crashed.text,/comparison is incomplete/i);
+    assert.doesNotMatch(crashed.text,/Final comparison/);
+    assert.doesNotMatch(crashed.text,/impl-report:/);
+    assert.deepEqual(events,['worker','check','reviewer']);
+    reviewerFailure=false;
+
+    // A reviewer failure after a confirmed delivery still surfaces the locked
+    // verdict, but does not pretend delivery failed.
+    events.length=0; postExecute='pass'; reviewerFailure=true;
+    const deliveredCrash=await run();
+    assert.equal(deliveredCrash.kind,'error',deliveredCrash.text);
+    assert.match(deliveredCrash.text,/reviewer stopped after reading the report/);
+    assert.match(deliveredCrash.text,/Initial verdict \(locked; the run failed before producing a final comparison\)/);
+    assert.match(deliveredCrash.text,/Boundary fails at -1/);
+    assert.match(deliveredCrash.text,/comparison is incomplete/i);
+    assert.doesNotMatch(deliveredCrash.text,/Final comparison/);
+    assert.doesNotMatch(deliveredCrash.text,/impl-report:/);
+    assert.deepEqual(events,['worker','check','reviewer']);
+    reviewerFailure=false;
+
+    assert.deepEqual(logs.map(x=>x[0]), ['command/run','command/done','command/run','command/done','command/run','command/done','command/run','command/done','command/run','command/done','command/run','command/done']);
   } finally {
     for(const f of fibers.reverse()) await f.dispose();
     for(const s of scopes) await s.dispose();

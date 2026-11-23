@@ -136,6 +136,70 @@ test('reveal: keeps the callback armed after a successful reveal', () => {
   dispose()
 })
 
+// Regression: only a pure protocol call may treat its synchronous return as
+// delivery; a Host tool execution must present its exact execution token.
+test('reveal: a provided execution without a Host token fails closed', () => {
+  const child = agentKey('token-required')
+  let calls = 0
+  const dispose = armReveal(child, () => {
+    calls += 1
+    return 'report'
+  })
+  const base = { name: 'boost_reveal', agent: { id: child } }
+
+  for (const [label, execution] of [
+    ['missing token', base],
+    ['null token', { ...base, token: null }],
+    ['string token', { ...base, token: 'not-a-symbol' }],
+  ]) {
+    assert.throws(
+      () => revealPredecessor(child, 'verdict', execution),
+      assertRevealError('REVEAL_EXECUTION_TOKEN_REQUIRED'),
+      label,
+    )
+  }
+  assert.throws(
+    () => revealPredecessor(child, 'verdict', null),
+    assertRevealError('INVALID_REVEAL_EXECUTION'),
+  )
+  assert.throws(
+    () => revealPredecessor(child, 'verdict', 42),
+    assertRevealError('INVALID_REVEAL_EXECUTION'),
+  )
+  assert.throws(
+    () => revealPredecessor(child, 'verdict', undefined),
+    assertRevealError('INVALID_REVEAL_EXECUTION'),
+    'an explicitly absent execution argument is not a direct protocol call',
+  )
+  assert.equal(calls, 0)
+
+  // Only omission of the execution argument itself keeps the synchronous
+  // pure-protocol behavior.
+  assert.equal(revealPredecessor(child, 'verdict'), 'report')
+  assert.equal(calls, 1)
+  dispose()
+})
+
+test('reveal: forwards the final isError unchanged so a missing flag is not success', () => {
+  const child = agentKey('is-error-faithful')
+  const observations = []
+  const revealFn = () => 'report'
+  revealFn.confirmDelivery = observation => {
+    observations.push(observation)
+    return observation.isError === false
+  }
+  const dispose = armReveal(child, revealFn)
+  const exec = { name: 'boost_reveal', agent: { id: child }, token: Symbol('faithful') }
+
+  assert.equal(revealPredecessor(child, 'verdict', exec), 'report')
+  const content = [{ type: 'text', text: 'report' }]
+  assert.equal(observeRevealResult(exec, { content }), false)
+  assert.equal(observations.length, 1)
+  assert.equal(observations[0].isError, undefined)
+  assert.deepEqual(observations[0].content, content)
+  dispose()
+})
+
 test('reveal: defers delivery for an exact execution and only that result confirms it', () => {
   const child = agentKey('delivery')
   const other = agentKey('delivery-other')
@@ -265,7 +329,10 @@ test('policy reviewer: registers only boost_reveal and serves the predecessor re
   assert.equal(typeof definition.output.render, 'function')
 
   const dispose = armReveal(child, verdict => `predecessor:${verdict}`)
-  const report = await definition.execute({ initialVerdict: 'looks good' }, { agent: { id: child } })
+  const report = await definition.execute(
+    { initialVerdict: 'looks good' },
+    { name: 'boost_reveal', agent: { id: child }, token: Symbol('policy-review') },
+  )
   assert.equal(report, 'predecessor:looks good')
   assert.deepEqual(definition.output.render(null, report), [{ type: 'text', text: 'predecessor:looks good' }])
 
@@ -329,6 +396,32 @@ test('policy reviewer: confirms delivery through the tools/result observer for t
 
   events[0].handler(exec, { isError: false, content: [{ type: 'text', text: 'predecessor:locked' }] })
   assert.equal(confirmations.length, 1)
+  dispose()
+})
+
+test('policy reviewer: a tool call without an execution token never claims delivery', async () => {
+  const child = agentKey('reviewer-token')
+  const { service, calls } = toolsService([])
+  apply(policyContext(service), { role: 'reviewer' })
+  let reveals = 0
+  const dispose = armReveal(child, () => {
+    reveals += 1
+    return 'report'
+  })
+
+  await assert.rejects(
+    calls.register[0].execute(
+      { initialVerdict: 'locked' },
+      { name: 'boost_reveal', agent: { id: child } },
+    ),
+    assertRevealError('REVEAL_EXECUTION_TOKEN_REQUIRED'),
+  )
+  await assert.rejects(
+    calls.register[0].execute({ initialVerdict: 'locked' }, undefined),
+    assertRevealError('REVEAL_CALLER_REQUIRED'),
+    'a Host tool call without any execution context never claims delivery',
+  )
+  assert.equal(reveals, 0)
   dispose()
 })
 

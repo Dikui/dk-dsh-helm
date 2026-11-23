@@ -72,6 +72,34 @@ function assertNotAborted(signal, phase) {
   }
 }
 
+/**
+ * Keep a locked verdict attached to the failure that ended the run, including
+ * failures after the report was delivered. The error object itself (including
+ * AbortError identity) is preserved; only the retained verdict is added when
+ * the object can carry it.
+ */
+function retainLockedVerdict(error, state) {
+  if (!state.locked) {
+    return error;
+  }
+  try {
+    if ((typeof error === 'object' && error !== null) || typeof error === 'function') {
+      Object.defineProperties(error, {
+        initialVerdict: { value: state.initialVerdict, configurable: true },
+        deliveryFailure: {
+          value: state.delivered ? null : (state.deliveryFailure ?? 'not-observed'),
+          configurable: true,
+        },
+        deliveryConfirmed: { value: state.delivered === true, configurable: true },
+      });
+    }
+  } catch {
+    // A frozen or exotic rejection value cannot carry the note; never replace
+    // it, so cancellation and other rejection semantics stay intact.
+  }
+  return error;
+}
+
 async function runPhase(phase, signal, operation) {
   assertNotAborted(signal, phase);
 
@@ -225,8 +253,12 @@ function createReveal(state) {
     if (
       observation === null
       || typeof observation !== 'object'
-      || observation.isError !== false
+      || (observation.isError !== true && observation.isError !== false)
     ) {
+      state.deliveryFailure = 'invalid-result';
+      return false;
+    }
+    if (observation.isError === true) {
       state.deliveryFailure = 'error-result';
       return false;
     }
@@ -367,6 +399,8 @@ export async function runBoost(options = {}) {
       initialVerdict: state.initialVerdict,
       finalVerdict,
     };
+  } catch (error) {
+    throw retainLockedVerdict(error, state);
   } finally {
     state.closed = true;
     if (signal) {

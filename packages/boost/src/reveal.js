@@ -74,6 +74,17 @@ export function armReveal(childId, revealFn) {
 }
 
 /**
+ * @param {unknown} report - value returned by the armed reveal callback.
+ * @returns {string} the unchanged predecessor report.
+ */
+function requireReport(report) {
+  if (typeof report !== 'string') {
+    throw new BoostRevealError('INVALID_REVEAL_RESULT', 'the armed reveal callback did not return a predecessor report string')
+  }
+  return report
+}
+
+/**
  * Invoke the reveal callback armed for exactly this calling agent.
  * @param {string} agentId - `exec.agent.id` of the calling reviewer.
  * @param {string} initialVerdict - non-empty verdict text from the model.
@@ -94,13 +105,25 @@ export function revealPredecessor(agentId, initialVerdict, execution) {
     throw new BoostRevealError('EMPTY_INITIAL_VERDICT', 'boost_reveal requires a non-empty initialVerdict')
   }
 
-  const token = execution !== null && typeof execution === 'object' ? execution.token : undefined
-  if (token === undefined) {
-    const report = entry.revealFn(initialVerdict)
-    if (typeof report !== 'string') {
-      throw new BoostRevealError('INVALID_REVEAL_RESULT', 'the armed reveal callback did not return a predecessor report string')
-    }
-    return report
+  if (arguments.length < 3) {
+    // Pure protocol direct calls omit the execution argument entirely; the
+    // synchronous return is the delivery. A present argument, even `undefined`
+    // from a Host tool path, must identify the exact Host tool call.
+    return requireReport(entry.revealFn(initialVerdict))
+  }
+
+  if (execution === null || typeof execution !== 'object') {
+    throw new BoostRevealError(
+      'INVALID_REVEAL_EXECUTION',
+      'boost_reveal delivery requires its tool execution context',
+    )
+  }
+  const token = execution.token
+  if (typeof token !== 'symbol') {
+    throw new BoostRevealError(
+      'REVEAL_EXECUTION_TOKEN_REQUIRED',
+      'boost_reveal delivery requires the execution token supplied by the Host; refusing to treat this call as delivered',
+    )
   }
 
   if (execution.name !== 'boost_reveal' || execution.agent?.id !== key) {
@@ -116,10 +139,7 @@ export function revealPredecessor(agentId, initialVerdict, execution) {
     )
   }
 
-  const report = entry.revealFn(initialVerdict, { deferDelivery: true })
-  if (typeof report !== 'string') {
-    throw new BoostRevealError('INVALID_REVEAL_RESULT', 'the armed reveal callback did not return a predecessor report string')
-  }
+  const report = requireReport(entry.revealFn(initialVerdict, { deferDelivery: true }))
   pendingDeliveries.set(token, { agentId: key, entry })
   entry.tokens.add(token)
   return report
@@ -135,7 +155,7 @@ export function revealPredecessor(agentId, initialVerdict, execution) {
  */
 export function observeRevealResult(exec, result) {
   const token = exec !== null && typeof exec === 'object' ? exec.token : undefined
-  if (token === undefined) return false
+  if (typeof token !== 'symbol') return false
   const pending = pendingDeliveries.get(token)
   if (pending === undefined) return false
   if (exec.name !== 'boost_reveal' || exec.agent?.id !== pending.agentId) return false
@@ -148,7 +168,10 @@ export function observeRevealResult(exec, result) {
     return confirmDelivery({
       agentId: pending.agentId,
       token,
-      isError: result !== null && typeof result === 'object' && result.isError === true,
+      // DSH rc.5 has no default-success convention: a success result carries
+      // isError:false explicitly. Forward the final flag unchanged so a
+      // malformed event fails closed instead of being read as success.
+      isError: result?.isError,
       content: result?.content,
     }) === true
   } catch {

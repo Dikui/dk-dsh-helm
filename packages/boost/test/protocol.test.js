@@ -169,6 +169,11 @@ test('a blocked or replaced reveal result is not delivery, and the run keeps the
       },
       failure: 'content-mismatch',
     },
+    {
+      name: 'observation without a final isError flag',
+      observation: { content: [{ type: 'text', text: WORKER_REPORT }] },
+      failure: 'invalid-result',
+    },
   ];
 
   for (const { name, observation, failure } of cases) {
@@ -218,6 +223,60 @@ test('a deferred reveal with no observed delivery fails without reporting a comp
       assert.equal(error.initialVerdict, 'locked but never observed');
       assert.equal(error.deliveryFailure, 'not-observed');
       assert.doesNotMatch(error.message, /comparison (is )?complete/i);
+      return true;
+    },
+  );
+});
+
+// Regression: a reviewer that fails after locking a verdict must still surface
+// the sealed verdict, without replacing the original rejection.
+test('a reviewer failure after a blocked reveal still carries the locked initial verdict', async () => {
+  const boom = new Error('reviewer stopped after the blocked reveal');
+  await assert.rejects(
+    runBoost({
+      task: TASK,
+      runWorker: async () => WORKER_REPORT,
+      getEvidence: async () => EVIDENCE,
+      runReviewer: async (prompt, reveal) => {
+        reveal('locked before the crash', { deferDelivery: true });
+        assert.equal(
+          reveal.confirmDelivery({ isError: true, content: [{ type: 'text', text: 'blocked by policy' }] }),
+          false,
+        );
+        throw boom;
+      },
+    }),
+    (error) => {
+      assert.equal(error, boom);
+      assert.equal(error.initialVerdict, 'locked before the crash');
+      assert.equal(error.deliveryFailure, 'error-result');
+      assert.equal(error.deliveryConfirmed, false);
+      return true;
+    },
+  );
+});
+
+test('a reviewer failure after a delivered reveal still carries the locked initial verdict', async () => {
+  const boom = new Error('reviewer crashed after reading the predecessor report');
+  await assert.rejects(
+    runBoost({
+      task: TASK,
+      runWorker: async () => WORKER_REPORT,
+      getEvidence: async () => EVIDENCE,
+      runReviewer: async (prompt, reveal) => {
+        reveal('locked before the crash', { deferDelivery: true });
+        assert.equal(
+          reveal.confirmDelivery({ isError: false, content: [{ type: 'text', text: WORKER_REPORT }] }),
+          true,
+        );
+        throw boom;
+      },
+    }),
+    (error) => {
+      assert.equal(error, boom);
+      assert.equal(error.initialVerdict, 'locked before the crash');
+      assert.equal(error.deliveryFailure, null);
+      assert.equal(error.deliveryConfirmed, true);
       return true;
     },
   );
