@@ -86,9 +86,11 @@ test('reviewer and audit reports are parsed in full, not from a 20k prefix', () 
 
   const auditVeto = parseAuditReport([
     'PHASE A|pass|trace checked', 'PHASE B|pass|no edits', 'PHASE C|pass|receipt',
-    padding, 'VERDICT|pass|prefix ok', 'VERDICT|veto|tail audit veto',
+    'VERDICT|pass|prefix ok', padding, `VERDICT|veto|${padding}:tail audit veto`,
   ].join('\n'))
   assert.equal(auditVeto.verdict, 'veto')
+  assert.ok(auditVeto.reason.length <= 2000)
+  assert.match(auditVeto.reason, /tail audit veto$/u)
   assert.deepEqual(auditVeto.phases, { a: 'pass', b: 'pass', c: 'pass' })
 
   const auditPrefix = parseAuditReport([

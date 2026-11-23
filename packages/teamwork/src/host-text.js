@@ -359,7 +359,7 @@ export function parseAuditReport(text) {
   if (verdict === undefined) {
     return { verdict: 'fail', reason: 'Auditor did not state a VERDICT line.', phases, warnings }
   }
-  reason = lastReason(seenVerdicts, verdict) ?? ''
+  reason = clipMiddle(lastReason(seenVerdicts, verdict) ?? '', REPORT_REASON_LIMIT)
   if (verdict === 'pass') {
     const missing = ['a', 'b', 'c'].filter(key => phases[key] !== 'pass')
     if (missing.length > 0) {
