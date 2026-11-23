@@ -165,33 +165,25 @@ export function registerSwarmCommands(host) {
               const member = await host.killMember(entry.rootId, target);
               return { kind: 'success', text: `${member.name}: ${member.status}` };
             }
-            const board = host.state.board(entry.rootId);
-            const workers = Object.values(board?.members ?? {}).filter(
-              (member) => member.role !== 'coordinator' && member.status !== 'killed',
-            );
-            const killed = [];
-            const failed = [];
-            for (const member of workers) {
-              try {
-                killed.push((await host.killMember(entry.rootId, member.sessionId)).name);
-              } catch (error) {
-                host.log('warn', `finish: kill ${member.name} failed`, error);
-                failed.push(`${member.name}: ${error?.message ?? error}`);
-              }
-            }
+            const outcome = await host.finish(entry.rootId);
+            const { killed, failed } = outcome;
+            const cancelled = outcome.cancelled
+              ? ` Cancelled ${outcome.cancelled} in-flight add${outcome.cancelled === 1 ? '' : 's'}.`
+              : '';
             if (failed.length) {
               return {
                 kind: 'error',
                 text:
                   `Swarm finish was partial. Killed: ${killed.length ? killed.join(', ') : 'none'}. ` +
-                  `Still live: ${failed.join('; ')}. Retry /swarm finish.`,
+                  `Still live: ${failed.join('; ')}. Retry /swarm finish.${cancelled}`,
               };
             }
             return {
               kind: 'success',
-              text: killed.length
-                ? `Swarm finished. Killed: ${killed.join(', ')}. The board remains readable with /swarm view.`
-                : 'Swarm finished. There were no live teammates.',
+              text:
+                (killed.length
+                  ? `Swarm finished. Killed: ${killed.join(', ')}. The board remains readable with /swarm view.`
+                  : 'Swarm finished. There were no live teammates.') + cancelled,
             };
           }
           case 'done': {

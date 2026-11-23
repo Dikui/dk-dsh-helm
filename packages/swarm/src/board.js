@@ -70,6 +70,11 @@ export const DEFAULT_LIMITS = Object.freeze({
   maxPendingWakes: 512,
 });
 
+// Pages are cut by the final JSON that a model sees, not by the raw post bytes:
+// escaping can nearly double a post, and the envelope adds metadata. A single
+// legal post is always returned whole, even when it alone exceeds this budget.
+export const READ_RENDER_LIMIT = 9000;
+
 const ROLES = new Set(['coordinator', 'worker', 'monitor']);
 const STATUSES = new Set(['active', 'working', 'waiting', 'stopped', 'paused', 'killed']);
 const WAKE_MODES = new Set(['mentions', 'anything']);
@@ -817,9 +822,12 @@ function resumeMember(draft, actor, action, now) {
   if (target.role === 'coordinator') return fail(ERRORS.FORBIDDEN, 'coordinator cannot be paused');
   if (!canManage(actor, target)) return fail(ERRORS.FORBIDDEN, 'cannot manage this member');
   if (target.status === 'killed') return fail(ERRORS.CLOSED, 'member is killed');
+  // Pause released the real activation, so only a prior waiting/stopped state is
+  // still true. Anything else must come back as stopped (wakeable on a mention),
+  // never as active, or a later directed post has no running session to reach.
   target.status = target.pausedFromStatus === 'waiting' || target.pausedFromStatus === 'stopped'
     ? target.pausedFromStatus
-    : 'active';
+    : 'stopped';
   target.pausedFromStatus = null;
   target.quotaPausedAtSeq = null;
   target.updatedAtSeq = now;
@@ -919,6 +927,10 @@ function postMessage(draft, actor, action, now) {
   return ok({ seq, message: messageView(post) }, wakes);
 }
 
+function readEnvelopeSize(result) {
+  return JSON.stringify({ ok: true, ...result }, null, 2).length;
+}
+
 function readCursor(draft, member, readSeqs) {
   const bySeq = new Map();
   for (const post of draft.posts) bySeq.set(post.seq, post);
@@ -970,25 +982,54 @@ function readBoard(draft, actor, action, now) {
     }
     seqs = unique;
   }
-  const messages = visiblePostList(draft, actor, {
+  const candidates = visiblePostList(draft, actor, {
     since: seqs ? 0 : since,
     limit,
     seqs,
     channel: action.channel,
-  }).map(messageView);
-  const result = {
-    messages,
-    lastReadSeq: actor.lastReadSeq,
-    headSeq: draft.seq,
-    hasMore: false,
-    peek,
+  });
+  const envelope = (posts) => {
+    const messages = posts.map(messageView);
+    if (peek) {
+      return {
+        result: {
+          messages,
+          lastReadSeq: actor.lastReadSeq,
+          headSeq: draft.seq,
+          hasMore: false,
+          peek,
+        },
+      };
+    }
+    const readSeqs = new Set(messages.map((message) => message.seq));
+    const cursor = readCursor(draft, actor, readSeqs);
+    return {
+      cursor,
+      result: {
+        messages,
+        lastReadSeq: cursor,
+        headSeq: draft.seq,
+        hasMore: visiblePostList(draft, actor, { since: cursor, limit: 1 }).length > 0,
+        peek,
+      },
+    };
   };
-  if (peek) return ok(result);
 
-  const readSeqs = new Set(messages.map((message) => message.seq));
-  const cursor = readCursor(draft, actor, readSeqs);
+  const page = [];
+  let built = envelope(page);
+  for (const post of candidates) {
+    const trial = [...page, post];
+    const rendered = envelope(trial);
+    if (page.length > 0 && readEnvelopeSize(rendered.result) > READ_RENDER_LIMIT) break;
+    page.push(post);
+    built = rendered;
+    if (readEnvelopeSize(rendered.result) > READ_RENDER_LIMIT) break;
+  }
+
+  if (peek) return ok(built.result);
+
+  const cursor = built.cursor;
   actor.lastReadSeq = cursor;
-  result.lastReadSeq = cursor;
   if (actor.status === 'waiting' || actor.status === 'stopped') {
     actor.status = 'active';
     actor.waitSince = 0;
@@ -997,8 +1038,7 @@ function readBoard(draft, actor, action, now) {
   draft.pendingWakes = draft.pendingWakes.filter(
     (item) => item.sessionId !== actor.sessionId || item.seq > cursor,
   );
-  result.hasMore = visiblePostList(draft, actor, { since: cursor, limit: 1 }).length > 0;
-  return ok(result);
+  return ok(built.result);
 }
 
 function waitForWake(draft, actor, action, now) {

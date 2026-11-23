@@ -45,6 +45,9 @@ export class SwarmHost {
     this.makeMessage = makeMessage ?? defaultMakeMessage;
     this.lifecycle = new AbortController();
     this.handles = new Map();
+    this.retiredActivations = new WeakSet();
+    this.inflightAdds = new Map();
+    this.drains = new Map();
     this.remindedSeq = new Map();
     this.recentWakes = new Map();
     this.quotaFailures = new Map();
@@ -317,6 +320,130 @@ export class SwarmHost {
   // Native spawn with reserve -> spawn -> commit compensation
   // -------------------------------------------------------------------------
 
+  // An add is admitted for its whole reserve -> spawn -> commit window. finish
+  // cancels and drains that window per root before it reports success, so an
+  // already-accepted add can never register after the finish returned.
+  beginInflightAdd(rootId, sessionId) {
+    if (this.drains.has(rootId)) {
+      throw failure('BUSY', 'swarm finish is in progress; retry the add after it completes');
+    }
+    let resolve;
+    const done = new Promise((settle) => {
+      resolve = settle;
+    });
+    const guard = {
+      rootId,
+      sessionId,
+      cancelled: false,
+      reason: '',
+      controller: null,
+      done,
+      resolve,
+    };
+    this.inflightAdds.set(sessionId, guard);
+    return guard;
+  }
+
+  endInflightAdd(guard) {
+    if (this.inflightAdds.get(guard.sessionId) === guard) {
+      this.inflightAdds.delete(guard.sessionId);
+    }
+    guard.resolve();
+  }
+
+  cancelInflightAdd(guard, reason) {
+    if (guard.cancelled) return;
+    guard.cancelled = true;
+    guard.reason = String(reason ?? 'the board is finishing');
+    try {
+      guard.controller?.abort(new Error(guard.reason));
+    } catch {
+      // Abort is advisory; the post-spawn cancellation checks still apply.
+    }
+  }
+
+  cancelledAdd(guard) {
+    return failure('CANCELLED', `swarm add was cancelled: ${guard.reason || 'the board is finishing'}`);
+  }
+
+  async failJoin(rootId, reservationId, reason) {
+    if (!reservationId) return;
+    await this.state
+      .act(rootId, rootId, {
+        type: 'failJoin',
+        reservationId,
+        reason: oneLine(reason, 160),
+      })
+      .catch(() => {});
+  }
+
+  async disposeActivation(activation) {
+    if (!activation) return;
+    this.retiredActivations.add(activation);
+    try {
+      await activation.dispose?.();
+    } catch {
+      // Compensation must continue even when dispose itself throws.
+    }
+  }
+
+  async failOpenReservations(rootId, reason) {
+    const board = this.state.board(rootId);
+    for (const reservationId of Object.keys(board?.reservations ?? {})) {
+      try {
+        await this.state.act(rootId, rootId, {
+          type: 'failJoin',
+          reservationId,
+          reason: oneLine(reason, 160),
+        });
+      } catch (error) {
+        this.log('warn', `could not revoke reservation ${reservationId}`, error);
+      }
+    }
+  }
+
+  /**
+   * Finish one root: cancel and drain every in-flight add, revoke seats that
+   * never committed, then kill the remaining roster. New adds for this root are
+   * refused only while the drain is active; the board itself stays readable and
+   * a later add succeeds.
+   */
+  async finish(rootId) {
+    const running = this.drains.get(rootId);
+    if (running) await running.done.catch(() => {});
+    if (!this.state.board(rootId)) throw failure('NOT_MEMBER', 'no swarm board');
+    let settle;
+    const done = new Promise((resolve) => {
+      settle = resolve;
+    });
+    const drain = { done, resolve: settle };
+    this.drains.set(rootId, drain);
+    const killed = [];
+    const failed = [];
+    try {
+      const guards = [...this.inflightAdds.values()].filter((guard) => guard.rootId === rootId);
+      for (const guard of guards) this.cancelInflightAdd(guard, 'swarm finish');
+      await this.failOpenReservations(rootId, 'swarm finish');
+      await Promise.all(guards.map((guard) => guard.done));
+      await this.failOpenReservations(rootId, 'swarm finish');
+      const board = this.state.board(rootId);
+      for (const member of Object.values(board?.members ?? {})) {
+        if (member.role === 'coordinator' || member.status === 'killed') continue;
+        try {
+          const killedMember = await this.killMember(rootId, member.sessionId);
+          killed.push(killedMember?.name ?? member.name);
+        } catch (error) {
+          this.log('warn', `finish could not kill ${member.name}`, error);
+          failed.push(`${member.name}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      return { killed, failed, cancelled: guards.length };
+    } finally {
+      if (this.drains.get(rootId) === drain) this.drains.delete(rootId);
+      settle();
+    }
+  }
+
   async sharedCwd(rootAgent, signal) {
     const wd = this.ctx.workingDirectory;
     if (!wd || typeof wd.get !== 'function') {
@@ -353,129 +480,142 @@ export class SwarmHost {
     if (!text) throw failure('INVALID_ARGUMENT', 'a task prompt is required');
     if (!['worker', 'monitor'].includes(role)) throw failure('INVALID_ARGUMENT', 'role must be worker or monitor');
 
-    // Joining a channel is not creating it. Make the coordinator's intent
-    // explicit and idempotent: channel names passed at spawn time are created
-    // first, while an unknown channel still fails if creation itself fails.
-    if (Array.isArray(channels) && channels.length) {
-      await this.ensureChannels(rootId, channels);
-    }
-
     const sessionId = randomUUID();
-    const reserved = await this.state.act(rootId, rootId, {
-      type: 'reserveJoin',
-      member: {
-        sessionId,
-        name: cleanName,
-        role,
-        ...(Array.isArray(channels) && channels.length ? { channels } : {}),
-        ...(wakeMode ? { wakeMode } : {}),
-      },
-    });
-    if (!reserved.result?.ok) {
-      throw new HostError(reserved.result?.code ?? 'RESERVE_FAILED', reserved.result?.message ?? 'reserve failed');
-    }
-    const reservationId = reserved.result.reservationId;
-
-    const controller = new AbortController();
-    const onAbort = () => controller.abort(signal?.reason ?? new Error('swarm add aborted'));
-    if (signal?.aborted) onAbort();
-    else signal?.addEventListener?.('abort', onAbort, { once: true });
-    const timer = setTimeout(() => controller.abort(new Error('swarm spawn timed out')), timeoutMs);
-    timer.unref?.();
-
+    const guard = this.beginInflightAdd(rootId, sessionId);
     let activation = null;
+    let reservationId = null;
+    let timer = null;
+    let onAbort = null;
     try {
-      const cwd = await this.sharedCwd(rootAgent, signal);
-      const promptText = this.buildChildPrompt({
-        name: cleanName,
-        role,
-        rootName: entry.self?.name ?? 'lead',
-        prompt: text,
-        cwd,
-      });
-      activation = await this.ctx.subagents.startActivation({
-        provider: 'spawn',
-        delivery: 'caller',
-        parent: rootAgent,
-        prompt: [{ type: 'text', text: promptText }],
-        signal: controller.signal,
-        childId: sessionId,
-        ...(cwd ? { cwd } : {}),
-        ...(typeof this.ctx.subagents.resolveMaxDepth === 'function'
-          ? { maxDepth: this.ctx.subagents.resolveMaxDepth() }
-          : {}),
-        label: `swarm:${cleanName}`,
-      });
-      if (!activation || activation.childId !== sessionId) {
-        throw failure('SPAWN_FAILED', 'subagent returned an unexpected child id');
+      if (guard.cancelled) throw this.cancelledAdd(guard);
+
+      // Joining a channel is not creating it. Make the coordinator's intent
+      // explicit and idempotent: channel names passed at spawn time are created
+      // first, while an unknown channel still fails if creation itself fails.
+      if (Array.isArray(channels) && channels.length) {
+        await this.ensureChannels(rootId, channels);
       }
-    } catch (error) {
+      if (guard.cancelled) throw this.cancelledAdd(guard);
+
+      const reserved = await this.state.act(rootId, rootId, {
+        type: 'reserveJoin',
+        member: {
+          sessionId,
+          name: cleanName,
+          role,
+          ...(Array.isArray(channels) && channels.length ? { channels } : {}),
+          ...(wakeMode ? { wakeMode } : {}),
+        },
+      });
+      if (!reserved.result?.ok) {
+        throw new HostError(reserved.result?.code ?? 'RESERVE_FAILED', reserved.result?.message ?? 'reserve failed');
+      }
+      reservationId = reserved.result.reservationId;
+      if (guard.cancelled) {
+        await this.failJoin(rootId, reservationId, 'cancelled before spawn');
+        throw this.cancelledAdd(guard);
+      }
+
+      const controller = new AbortController();
+      guard.controller = controller;
+      onAbort = () => controller.abort(signal?.reason ?? new Error('swarm add aborted'));
+      if (guard.cancelled || signal?.aborted) onAbort();
+      else signal?.addEventListener?.('abort', onAbort, { once: true });
+      timer = setTimeout(() => controller.abort(new Error('swarm spawn timed out')), timeoutMs);
+      timer.unref?.();
+
+      try {
+        const cwd = await this.sharedCwd(rootAgent, signal);
+        if (guard.cancelled) throw this.cancelledAdd(guard);
+        const promptText = this.buildChildPrompt({
+          name: cleanName,
+          role,
+          rootName: entry.self?.name ?? 'lead',
+          prompt: text,
+          cwd,
+        });
+        activation = await this.ctx.subagents.startActivation({
+          provider: 'spawn',
+          delivery: 'caller',
+          parent: rootAgent,
+          prompt: [{ type: 'text', text: promptText }],
+          signal: controller.signal,
+          childId: sessionId,
+          ...(cwd ? { cwd } : {}),
+          ...(typeof this.ctx.subagents.resolveMaxDepth === 'function'
+            ? { maxDepth: this.ctx.subagents.resolveMaxDepth() }
+            : {}),
+          label: `swarm:${cleanName}`,
+        });
+        if (!activation || activation.childId !== sessionId) {
+          throw failure('SPAWN_FAILED', 'subagent returned an unexpected child id');
+        }
+        // Attach before any cancellation path can return: a disposed child may
+        // still reject its result, and that must not become unhandled.
+        if (typeof activation.result?.catch === 'function') activation.result.catch(() => {});
+        if (guard.cancelled) throw this.cancelledAdd(guard);
+      } catch (error) {
+        if (timer) clearTimeout(timer);
+        timer = null;
+        if (onAbort) signal?.removeEventListener?.('abort', onAbort);
+        onAbort = null;
+        await this.disposeActivation(activation);
+        await this.failJoin(
+          rootId,
+          reservationId,
+          error instanceof Error ? error.message : String(error),
+        );
+        throw asHostError(error);
+      }
       clearTimeout(timer);
-      signal?.removeEventListener?.('abort', onAbort);
-      await this.state
-        .act(rootId, rootId, {
-          type: 'failJoin',
-          reservationId,
-          reason: oneLine(error instanceof Error ? error.message : String(error), 160),
-        })
-        .catch(() => {});
-      throw asHostError(error);
-    }
-    clearTimeout(timer);
-    signal?.removeEventListener?.('abort', onAbort);
+      timer = null;
+      if (onAbort) signal?.removeEventListener?.('abort', onAbort);
+      onAbort = null;
 
-    // The child can finish its first turn before commitJoin lands. Observe the
-    // result only after the roster row exists, and suppress rejection until then
-    // so a failed commit cannot surface as an unhandled rejection.
-    if (typeof activation.result?.catch === 'function') activation.result.catch(() => {});
-
-    let committed;
-    try {
-      committed = await this.state.act(rootId, rootId, { type: 'commitJoin', reservationId });
-    } catch (error) {
-      this.handles.delete(sessionId);
+      // The child can finish its first turn before commitJoin lands. Observe the
+      // result only after the roster row exists, and suppress rejection until then
+      // so a failed commit cannot surface as an unhandled rejection.
+      let committed;
       try {
-        await activation.dispose?.();
-      } catch {
-        // Compensation must still fail the reservation if dispose itself throws.
-      }
-      await this.state
-        .act(rootId, rootId, {
-          type: 'failJoin',
+        committed = await this.state.act(rootId, rootId, { type: 'commitJoin', reservationId });
+      } catch (error) {
+        await this.disposeActivation(activation);
+        await this.failJoin(
+          rootId,
           reservationId,
-          reason: `commit threw: ${oneLine(error instanceof Error ? error.message : String(error), 160)}`,
-        })
-        .catch(() => {});
-      throw asHostError(error);
-    }
-    if (!committed.result?.ok) {
-      this.handles.delete(sessionId);
-      try {
-        await activation.dispose?.();
-      } catch {
-        // Compensation must still fail the reservation if dispose itself throws.
+          `commit threw: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        throw asHostError(error);
       }
-      await this.state
-        .act(rootId, rootId, {
-          type: 'failJoin',
-          reservationId,
-          reason: `commit failed: ${committed.result?.code ?? 'unknown'}`,
-        })
-        .catch(() => {});
-      throw new HostError(committed.result?.code ?? 'COMMIT_FAILED', committed.result?.message ?? 'commit failed');
+      if (!committed.result?.ok) {
+        await this.disposeActivation(activation);
+        await this.failJoin(rootId, reservationId, `commit failed: ${committed.result?.code ?? 'unknown'}`);
+        throw new HostError(committed.result?.code ?? 'COMMIT_FAILED', committed.result?.message ?? 'commit failed');
+      }
+      if (guard.cancelled) {
+        // finish accepted the add while its commit was landing. Tear the member
+        // down here, before this call returns, so no worker can keep running.
+        await this.disposeActivation(activation);
+        await this.state.act(rootId, rootId, { type: 'kill', target: sessionId }).catch(() => {});
+        throw this.cancelledAdd(guard);
+      }
+      if (typeof activation.result?.then === 'function') {
+        this.handles.set(sessionId, activation);
+        activation.result.then(
+          (result) => this.onActivationEnd(rootId, sessionId, result, activation).catch((error) =>
+            this.log('warn', `activation end for ${cleanName} failed`, error),
+          ),
+          (error) => this.onActivationEnd(rootId, sessionId, { stopReason: 'error', diagnostic: String(error) }, activation).catch(
+            (failureValue) => this.log('warn', `activation rejection for ${cleanName} failed`, failureValue),
+          ),
+        );
+      }
+      return { member: committed.result.member, sessionId, handle: activation };
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (onAbort) signal?.removeEventListener?.('abort', onAbort);
+      this.endInflightAdd(guard);
     }
-    if (typeof activation.result?.then === 'function') {
-      this.handles.set(sessionId, activation);
-      activation.result.then(
-        (result) => this.onActivationEnd(rootId, sessionId, result).catch((error) =>
-          this.log('warn', `activation end for ${cleanName} failed`, error),
-        ),
-        (error) => this.onActivationEnd(rootId, sessionId, { stopReason: 'error', diagnostic: String(error) }).catch(
-          (failureValue) => this.log('warn', `activation rejection for ${cleanName} failed`, failureValue),
-        ),
-      );
-    }
-    return { member: committed.result.member, sessionId, handle: activation };
   }
 
   buildChildPrompt({ name, role, rootName, prompt, cwd }) {
@@ -497,8 +637,14 @@ export class SwarmHost {
     return truncateText(lines.join('\n'), 16_000);
   }
 
-  async onActivationEnd(rootId, sessionId, result) {
-    this.handles.delete(sessionId);
+  async onActivationEnd(rootId, sessionId, result, activation) {
+    if (activation && this.retiredActivations.has(activation)) {
+      if (this.handles.get(sessionId) === activation) this.handles.delete(sessionId);
+      return;
+    }
+    if (!activation || this.handles.get(sessionId) === activation) {
+      this.handles.delete(sessionId);
+    }
     if (this.disposed) return;
     const board = this.state.board(rootId);
     const member = board?.members?.[sessionId];
@@ -549,6 +695,7 @@ export class SwarmHost {
     if (type === 'kill' || type === 'pause') {
       const handle = this.handles.get(member.sessionId);
       if (handle) {
+        this.retiredActivations.add(handle);
         this.handles.delete(member.sessionId);
         try {
           await handle.dispose?.();

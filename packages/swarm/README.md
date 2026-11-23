@@ -18,7 +18,7 @@ Swarm 让同一棵 DSH 子代理树里的成员围绕一个持久黑板协作：
 /swarm status
 ```
 
-成员调用 `read_board` 阅读对自己可见的帖子，调用 `post_message` 公布结果；已经读完时调用 `swarm_wait` 结束当前回合，而不是循环等待。`@name` 是门铃，不是普通抄送。`/swarm finish` 停用团队成员并保留黑板；不会撤销成员已经写入的文件。
+成员调用 `read_board` 阅读对自己可见的帖子，调用 `post_message` 公布结果；已经读完时调用 `swarm_wait` 结束当前回合，而不是循环等待。`@name` 是门铃，不是普通抄送。`/swarm finish` 停用团队成员并保留黑板；不会撤销成员已经写入的文件。`read_board` 按最终渲染的 JSON 分页（`hasMore` 为 true 时继续读，单篇合法帖子即使转义后超过上限也会完整返回），无参数 `/swarm finish` 会先取消并等待同一根会话上正在启动的成员，再停用剩余名单。
 
 ## 怎样读黑板
 

@@ -168,6 +168,24 @@ async function addAlice(rt, options = {}) {
   });
 }
 
+function deferred() {
+  let resolve;
+  const promise = new Promise((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
+const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+async function waitFor(predicate, label) {
+  for (let index = 0; index < 200; index += 1) {
+    if (predicate()) return;
+    await tick();
+  }
+  assert.fail(`timed out waiting for ${label}`);
+}
+
 test('creates a board and spawns a native member with the shared cwd', async (t) => {
   const rt = await setup();
   t.after(() => rt.host.close());
@@ -464,6 +482,80 @@ test('registers four gated tools and shows social tools only after a worker join
   assert.equal(concluded, 1);
 });
 
+test('read_board paginates by the rendered JSON and returns an oversized escaped post whole', async (t) => {
+  const rt = await setup();
+  t.after(() => rt.host.close());
+  const alice = await addAlice(rt);
+  registerSwarmTools(rt.host);
+  const tool = rt.tools.find((entry) => entry.definition.name === 'read_board').definition;
+  const agent = rt.agents.get(alice.sessionId);
+  const read = async () => {
+    const value = await tool.execute({}, { agent, signal: new AbortController().signal });
+    const text = tool.output.render({}, value)[0].text;
+    return { value, text, page: JSON.parse(text) };
+  };
+
+  const first = 'a'.repeat(6144);
+  const second = 'b'.repeat(6144);
+  await rt.host.post('root', 'root', first);
+  await rt.host.post('root', 'root', second);
+
+  const page1 = await read();
+  assert.ok(page1.text.length <= 9000, 'ordinary pages fit the tool render limit');
+  assert.deepEqual(page1.page.messages.map((message) => message.seq), [1]);
+  assert.equal(page1.page.messages[0].text, first);
+
+  const page2 = await read();
+  assert.ok(page2.text.length <= 9000);
+  assert.deepEqual(page2.page.messages.map((message) => message.seq), [2]);
+  assert.equal(page2.page.messages[0].text, second);
+
+  const escaped = '"'.repeat(6144);
+  await rt.host.post('root', 'root', escaped);
+  const page3 = await read();
+  assert.deepEqual(page3.page.messages.map((message) => message.seq), [3]);
+  assert.equal(page3.page.messages[0].text, escaped);
+  assert.ok(page3.text.length > 9000, 'the escaped singleton alone exceeds the ordinary render budget');
+  assert.equal(page3.page.lastReadSeq, 3);
+
+  const empty = await read();
+  assert.deepEqual(empty.page.messages, [], 'the next read is empty, not a repeat of the oversized post');
+  assert.equal(empty.page.lastReadSeq, 3);
+});
+
+test('resuming a paused active member keeps it stopped and wakeable, ignoring its stale activation', async (t) => {
+  const gate = deferred();
+  const rt = await setup({ activationResult: gate.promise });
+  t.after(() => rt.host.close());
+  const alice = await addAlice(rt);
+
+  await rt.host.pauseMember('root', 'alice');
+  const resumed = await rt.host.resumeMember('root', 'alice');
+  assert.equal(resumed.status, 'stopped', 'a released activation cannot be resumed optimistically');
+  assert.equal(rt.sends.length, 0, 'there was no unread directed post to catch up');
+
+  await rt.host.post('root', 'root', 'now wake @alice');
+  assert.equal(rt.sends.length, 1, 'a later mention still wakes the resumed member');
+  assert.equal(rt.sends[0].targetId, alice.sessionId);
+  assert.equal(rt.state.board('root').pendingWakes.length, 0);
+
+  gate.resolve({ stopReason: 'error', diagnostic: 'activation went away while paused' });
+  await tick();
+  await tick();
+  assert.equal(rt.root.steers.length, 0, 'the stale activation callback must not report a stop for the live member');
+  assert.equal(rt.state.member('root', alice.sessionId).status, 'stopped');
+
+  await rt.host.pauseMember('root', 'alice');
+  await rt.host.post('root', 'root', 'missed @alice');
+  assert.equal(rt.sends.length, 1, 'a paused member is not woken');
+  const caught = await rt.host.resumeMember('root', 'alice');
+  assert.equal(caught.status, 'stopped');
+  assert.equal(rt.sends.length, 2, 'resume catches up the missed directed post exactly once');
+  assert.equal(rt.sends[1].targetId, alice.sessionId);
+  assert.match(rt.sends[1].text, /new board activity|unread/i);
+  assert.equal(rt.state.board('root').pendingWakes.length, 0);
+});
+
 test('commands cover view, done and explicit channel membership', async (t) => {
   const rt = await setup();
   t.after(() => rt.host.close());
@@ -541,6 +633,197 @@ test('finish reports a partial kill instead of claiming success', async (t) => {
   const board = rt.state.board('root');
   assert.equal(board.members[alice.sessionId].status, 'killed');
   assert.notEqual(board.members[bob.sessionId].status, 'killed');
+});
+
+test('finish waits for an in-flight add whose spawn ignores the signal, revokes it, and keeps the board open', async (t) => {
+  const rt = await setup();
+  t.after(() => rt.host.close());
+  registerSwarmCommands(rt.host);
+  const command = rt.commands[0];
+  const gate = deferred();
+  let gatedSpec;
+
+  rt.ctx.subagents.startActivation = async (spec) => {
+    gatedSpec = spec;
+    await gate.promise;
+    const child = fakeAgent(spec.childId);
+    rt.agents.set(child.id, child);
+    return {
+      childId: spec.childId,
+      result: new Promise(() => {}),
+      dispose: async () => {
+        rt.disposals.push(spec.childId);
+        rt.agents.delete(spec.childId);
+      },
+    };
+  };
+
+  const adding = addAlice(rt).then(
+    () => null,
+    (error) => error,
+  );
+  await waitFor(
+    () => Object.keys(rt.state.board('root').reservations).length === 1,
+    'the add to reserve its seat',
+  );
+
+  const finishing = command.handler({
+    agent: rt.root,
+    rawInput: 'finish',
+    signal: new AbortController().signal,
+  });
+  let settled = false;
+  finishing.then(() => {
+    settled = true;
+  });
+  await waitFor(
+    () => Object.keys(rt.state.board('root').reservations).length === 0,
+    'finish to revoke the open reservation',
+  );
+  assert.equal(settled, false, 'finish must wait for the in-flight add to end');
+  await assert.rejects(() => addAlice(rt, { name: 'bob' }), /finish|busy/i);
+
+  gate.resolve();
+  const addError = await adding;
+  assert.match(String(addError), /finish|cancel/i);
+  assert.ok(rt.disposals.includes(gatedSpec.childId), 'the spawned activation is compensated');
+
+  const out = await finishing;
+  assert.equal(out.kind, 'success');
+  const board = rt.state.board('root');
+  assert.equal(board.members[gatedSpec.childId], undefined, 'the accepted add never registers late');
+  assert.deepEqual(Object.keys(board.reservations), []);
+
+  const bob = await addAlice(rt, { name: 'bob' });
+  assert.equal(rt.state.member('root', bob.sessionId).status, 'active', 'finish does not close the blackboard');
+});
+
+test('finish cancels an add whose commit lands after the drain has started', async (t) => {
+  const rt = await setup();
+  t.after(() => rt.host.close());
+  registerSwarmCommands(rt.host);
+  const command = rt.commands[0];
+  const commitGate = deferred();
+  const commitEntered = deferred();
+  const original = rt.state.act.bind(rt.state);
+  let held = false;
+  rt.state.act = async (rootId, actorId, action) => {
+    const out = await original(rootId, actorId, action);
+    if (!held && action.type === 'commitJoin') {
+      held = true;
+      commitEntered.resolve();
+      await commitGate.promise;
+    }
+    return out;
+  };
+
+  const adding = addAlice(rt).then(
+    () => null,
+    (error) => error,
+  );
+  await commitEntered.promise;
+  const finishing = command.handler({
+    agent: rt.root,
+    rawInput: 'finish',
+    signal: new AbortController().signal,
+  });
+  commitGate.resolve();
+
+  assert.match(String(await adding), /finish|cancel/i);
+  assert.equal((await finishing).kind, 'success');
+  const board = rt.state.board('root');
+  const workers = Object.values(board.members).filter((member) => member.role !== 'coordinator');
+  assert.equal(workers.length, 1);
+  assert.equal(workers[0].status, 'killed', 'a commit that won the race is killed before finish returns');
+  assert.ok(rt.disposals.includes(rt.spawns[0].childId), 'the late activation is disposed');
+});
+
+test('finish still succeeds when a cancelled spawn throws', async (t) => {
+  const rt = await setup();
+  t.after(() => rt.host.close());
+  registerSwarmCommands(rt.host);
+  const command = rt.commands[0];
+  const gate = deferred();
+  rt.ctx.subagents.startActivation = async () => {
+    await gate.promise;
+    throw new Error('spawn refused after cancellation');
+  };
+
+  const adding = addAlice(rt).then(
+    () => null,
+    (error) => error,
+  );
+  await waitFor(
+    () => Object.keys(rt.state.board('root').reservations).length === 1,
+    'the add to reserve its seat',
+  );
+  const finishing = command.handler({
+    agent: rt.root,
+    rawInput: 'finish',
+    signal: new AbortController().signal,
+  });
+  await waitFor(
+    () => Object.keys(rt.state.board('root').reservations).length === 0,
+    'finish to revoke the open reservation',
+  );
+  gate.resolve();
+
+  const addError = await adding;
+  assert.match(String(addError), /spawn refused|cancel/i);
+  const out = await finishing;
+  assert.equal(out.kind, 'success');
+  assert.equal(Object.keys(rt.state.board('root').members).length, 1, 'coordinator only');
+  assert.deepEqual(Object.keys(rt.state.board('root').reservations), []);
+});
+
+test('finish on one root does not block an add on another root', async (t) => {
+  const rt = await setup();
+  t.after(() => rt.host.close());
+  const root2 = fakeAgent('root-2');
+  rt.agents.set(root2.id, root2);
+  const baseRootOf = rt.ctx.subagents.rootOf.bind(rt.ctx.subagents);
+  rt.ctx.subagents.rootOf = (agent) => (agent.id === root2.id ? root2 : baseRootOf(agent));
+  await rt.state.create(root2, 'Other', 'lead');
+  registerSwarmCommands(rt.host);
+  const command = rt.commands[0];
+
+  const gate = deferred();
+  const baseStart = rt.ctx.subagents.startActivation.bind(rt.ctx.subagents);
+  rt.ctx.subagents.startActivation = async (spec) => {
+    if (spec.parent.id === 'root') await gate.promise;
+    return baseStart(spec);
+  };
+
+  const adding = addAlice(rt).then(
+    () => null,
+    (error) => error,
+  );
+  await waitFor(
+    () => Object.keys(rt.state.board('root').reservations).length === 1,
+    'the first root to reserve',
+  );
+  const finishing = command.handler({
+    agent: rt.root,
+    rawInput: 'finish',
+    signal: new AbortController().signal,
+  });
+  await waitFor(
+    () => Object.keys(rt.state.board('root').reservations).length === 0,
+    'finish to revoke the first root reservation',
+  );
+
+  const other = await rt.host.addMember({
+    rootAgent: root2,
+    name: 'carol',
+    prompt: 'other task',
+    signal: new AbortController().signal,
+  });
+  assert.equal(rt.state.member(root2.id, other.sessionId).status, 'active');
+
+  gate.resolve();
+  assert.match(String(await adding), /finish|cancel/i);
+  assert.equal((await finishing).kind, 'success');
+  assert.equal(rt.state.member(root2.id, other.sessionId).status, 'active', 'the other board stays usable');
 });
 
 test('board keys are path-safe for per-record storage', () => {

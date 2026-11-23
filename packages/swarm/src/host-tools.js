@@ -1,3 +1,4 @@
+import { READ_RENDER_LIMIT } from './board.js';
 import { asHostError, byteLength, failure, isPlainObject, truncateText } from './host-format.js';
 
 const OUTPUT = {
@@ -9,7 +10,13 @@ const OUTPUT = {
 
 function json(value) {
   const text = JSON.stringify(value, null, 2);
-  return [{ type: 'text', text: truncateText(text, 9000) }];
+  return [{ type: 'text', text: truncateText(text, READ_RENDER_LIMIT) }];
+}
+
+// read_board already cuts pages by the rendered envelope; truncating it again
+// would silently drop the tail of the last message on the page.
+function jsonExact(value) {
+  return [{ type: 'text', text: JSON.stringify(value, null, 2) }];
 }
 
 function schema(properties, required = []) {
@@ -265,7 +272,7 @@ export function registerSwarmTools(host) {
     {
       name: 'read_board',
       description:
-        'Read Swarm board messages since your cursor. A normal read advances your cursor and clears delivered wakes; peek=true only inspects. The result includes resolved targets.',
+        'Read Swarm board messages since your cursor. A normal read advances your cursor and clears delivered wakes; peek=true only inspects. The result includes resolved targets. Pages are sized by the rendered JSON: when hasMore is true, read again. A single legal post is always returned whole.',
       parameters: schema({
         since: { type: 'integer', minimum: 0, description: 'First sequence to include (default: your cursor).' },
         limit: { type: 'integer', minimum: 1, maximum: 200, description: 'Max messages (default 100).' },
@@ -273,7 +280,7 @@ export function registerSwarmTools(host) {
         channel: { type: 'string', description: 'Only this channel.' },
         peek: { type: 'boolean', description: 'Do not advance the cursor.' },
       }),
-      output: { schema: OUTPUT, render: (_args, value) => json(value) },
+      output: { schema: OUTPUT, render: (_args, value) => jsonExact(value) },
       isConcurrencySafe: false,
       async execute(args, exec) {
         try {

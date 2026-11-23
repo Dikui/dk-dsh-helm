@@ -131,6 +131,7 @@ import {
   boardHead,
   boardView,
   visiblePosts,
+  READ_RENDER_LIMIT,
   ERRORS,
 } from '../src/board.js';
 
@@ -429,6 +430,56 @@ test('read walks the cursor forward and never skips unread posts', () => {
   });
   assert.deepEqual(jumped.result.messages.map((m) => m.seq), [3]);
   assert.equal(jumped.result.lastReadSeq, 0, 'reading seq 3 cannot skip unread seq 1');
+});
+
+test('read pages long posts by their rendered envelope instead of dropping them', () => {
+  const envelopeSize = (result) => JSON.stringify({ ok: true, ...result }, null, 2).length;
+  let board = addWorker(seedBoard()).state;
+  board = transition(board, COORD, { type: 'post', text: 'start' }).state;
+  board = transition(board, WORKER, { type: 'read' }).state;
+  board = park(board, WORKER).state;
+
+  const first = 'a'.repeat(6000) + ' @worker-1';
+  const second = 'b'.repeat(6000) + ' @worker-1';
+  board = transition(board, COORD, { type: 'post', text: first }).state;
+  const posted = transition(board, COORD, { type: 'post', text: second });
+  board = posted.state;
+  assert.deepEqual(posted.wakes.map((wake) => wake.seq), [3], 'pending wake follows the newest post');
+
+  const page1 = transition(board, WORKER, { type: 'read' });
+  assert.deepEqual(page1.result.messages.map((m) => m.seq), [2], 'only the post that fits is delivered');
+  assert.equal(page1.result.lastReadSeq, 2);
+  assert.equal(page1.result.hasMore, true);
+  assert.ok(envelopeSize(page1.result) <= READ_RENDER_LIMIT);
+  assert.deepEqual(page1.state.pendingWakes.map((wake) => wake.seq), [3], 'unsent post keeps its doorbell');
+
+  const page2 = transition(page1.state, WORKER, { type: 'read' });
+  assert.deepEqual(page2.result.messages.map((m) => m.seq), [3]);
+  assert.deepEqual(page2.result.messages.map((m) => m.text), [second]);
+  assert.equal(page2.result.lastReadSeq, 3);
+  assert.equal(page2.result.hasMore, false);
+  assert.deepEqual(page2.state.pendingWakes, []);
+
+  const empty = transition(page2.state, WORKER, { type: 'read' });
+  assert.deepEqual(empty.result.messages, [], 'the page after the last post is empty');
+  assert.equal(empty.result.lastReadSeq, 3);
+});
+
+test('a single post whose escaped rendering exceeds the limit is still returned whole', () => {
+  const text = '"'.repeat(6144);
+  let board = addWorker(seedBoard()).state;
+  board = transition(board, COORD, { type: 'post', text }).state;
+
+  const page = transition(board, WORKER, { type: 'read' });
+  assert.deepEqual(page.result.messages.map((m) => m.seq), [1]);
+  assert.equal(page.result.messages[0].text, text);
+  assert.ok(JSON.stringify({ ok: true, ...page.result }, null, 2).length > READ_RENDER_LIMIT);
+  assert.equal(page.result.lastReadSeq, 1);
+  assert.equal(page.result.hasMore, false);
+
+  const again = transition(page.state, WORKER, { type: 'read' });
+  assert.deepEqual(again.result.messages, [], 'the oversized post is not delivered twice');
+  assert.equal(again.result.lastReadSeq, 1);
 });
 
 test('read hides channels the member cannot see', () => {
@@ -1088,6 +1139,29 @@ test('resume restores the status the member had before pausing', () => {
   const pausedAgain = transition(stopped, COORD, { type: 'pause', target: WORKER }).state;
   const resumedAgain = transition(pausedAgain, COORD, { type: 'resume', target: WORKER });
   assert.equal(resumedAgain.state.members[WORKER].status, 'stopped');
+});
+
+test('resuming a paused active member leaves it wakeable instead of optimistically active', () => {
+  let board = addWorker(seedBoard()).state;
+  const paused = transition(board, COORD, { type: 'pause', target: WORKER });
+  const resumed = transition(paused.state, COORD, { type: 'resume', target: WORKER });
+  assert.equal(resumed.result.ok, true);
+  assert.equal(
+    resumed.state.members[WORKER].status,
+    'stopped',
+    'resume must not claim an activation that was released',
+  );
+  assert.deepEqual(resumed.wakes, [], 'there is no unread directed post to catch up');
+
+  const mentioned = transition(resumed.state, COORD, {
+    type: 'post',
+    text: 'now wake @worker-1',
+  });
+  assert.deepEqual(
+    mentioned.wakes.map((wake) => wake.sessionId),
+    [WORKER],
+    'a later mention must still wake the resumed member',
+  );
 });
 
 test('wake acknowledgements guard malformed batches and retries validate ids', () => {
