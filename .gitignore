@@ -1,0 +1,14 @@
+node_modules/
+*.tgz
+.DS_Store
+
+# Local development checkouts, worktrees and research; not plugin sources.
+/dk-dsh-boost/
+/dk-dsh-swarm/
+/dk-dsh-teamwork/
+/.boost-*/
+/.swarm-*/
+/.teamwork-*/
+/boost-release/
+/docs/research/
+/verify-multiagent-bundles.mjs

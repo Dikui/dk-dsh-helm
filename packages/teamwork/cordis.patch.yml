@@ -1,0 +1,160 @@
+# /teamwork Host entrypoint and four isolated role presets.
+#
+# The Host row registers the command. Each preset below is a fresh child
+# identity with its own tool allowlist and no delegation, history, web, goal,
+# or profile tools. Implementers may write inside the workspace; explorers,
+# reviewers, and the victory auditor are read-only and have no shell. This is a
+# tool-policy boundary, not an OS jail: prompts state that honestly.
+- insert:
+    - id: dk-teamwork-command
+      name: '@local/dk-dsh-teamwork'
+
+    - id: preset-dk-teamwork-implementer
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: dk-teamwork-implementer
+        name: Teamwork Implementer
+        description: /teamwork implementer with workspace files, search, and foreground shell; no delegation or profile tools.
+        order: 30
+        plugins:
+          - id: dk-teamwork-implementer-executor
+            name: '@deepseek-ai/dsh-tool-executor-native'
+          - id: dk-teamwork-implementer-persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: |-
+                You are a fresh implementer for one /teamwork task. You may read, search, edit, and write files
+                inside the assigned workspace, and run foreground shell commands. You have no delegation,
+                messaging, session-history, web, scheduling, profile, goal, or browser tools; do not ask for them.
+
+                The human-confirmed acceptance command belongs to the host. Do not run it yourself and do not
+                claim it passed. Keep writes inside the workspace, do not push or install a profile, and finish
+                with CHANGED / VERIFY / OPEN lines as instructed. Tool policy is a guardrail, not an OS jail.
+              complete: true
+          - id: dk-teamwork-implementer-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              readImage: false
+              applyPatch: false
+          - id: dk-teamwork-implementer-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: dk-teamwork-implementer-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            config:
+              enableRunInBackground: false
+              promoteOnTimeout: false
+          - id: dk-teamwork-implementer-policy
+            name: '@local/dk-dsh-teamwork/policy'
+            config:
+              role: implementer
+
+    - id: preset-dk-teamwork-explorer
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: dk-teamwork-explorer
+        name: Teamwork Explorer
+        description: /teamwork read-only explorer for repository survey and constraints; no write, shell, or delegation.
+        order: 31
+        plugins:
+          - id: dk-teamwork-explorer-executor
+            name: '@deepseek-ai/dsh-tool-executor-native'
+          - id: dk-teamwork-explorer-persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: |-
+                You are a fresh read-only explorer for one /teamwork task. You may only read files and search
+                the workspace. You cannot write, edit, run shell commands, run tests, or delegate. Report what
+                you observed, where it lives, and what remains uncertain; never claim a test result you did not see.
+              complete: true
+          - id: dk-teamwork-explorer-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              read: true
+              write: false
+              edit: false
+              readImage: false
+              applyPatch: false
+          - id: dk-teamwork-explorer-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: dk-teamwork-explorer-policy
+            name: '@local/dk-dsh-teamwork/policy'
+            config:
+              role: explorer
+
+    - id: preset-dk-teamwork-reviewer
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: dk-teamwork-reviewer
+        name: Teamwork Reviewer
+        description: /teamwork independent read-only reviewer/challenger; no write, shell, delegation, or acceptance run.
+        order: 32
+        plugins:
+          - id: dk-teamwork-reviewer-executor
+            name: '@deepseek-ai/dsh-tool-executor-native'
+          - id: dk-teamwork-reviewer-persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: |-
+                You are an independent read-only verifier for one /teamwork round. You may only read files and
+                search the workspace. You cannot write, edit, run shell commands, run the acceptance command,
+                or delegate. Judge the implementation and the host's evidence package; cite concrete files and
+                lines. Report VERDICT plus ISSUE/FIXED/STILL lines exactly as instructed. Never claim a human
+                confirmation or a passing acceptance run you did not see in the evidence package.
+              complete: true
+          - id: dk-teamwork-reviewer-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              read: true
+              write: false
+              edit: false
+              readImage: false
+              applyPatch: false
+          - id: dk-teamwork-reviewer-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: dk-teamwork-reviewer-policy
+            name: '@local/dk-dsh-teamwork/policy'
+            config:
+              role: reviewer
+
+    - id: preset-dk-teamwork-auditor
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: dk-teamwork-auditor
+        name: Teamwork Victory Auditor
+        description: /teamwork fresh-context victory auditor; read-only, no shell, no acceptance run, no delegation.
+        order: 33
+        plugins:
+          - id: dk-teamwork-auditor-executor
+            name: '@deepseek-ai/dsh-tool-executor-native'
+          - id: dk-teamwork-auditor-persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: |-
+                You are a fresh-context victory auditor for one /teamwork run. You may only read files and search
+                the workspace. You cannot write, edit, run shell commands, run the acceptance command, or delegate.
+                Audit the original request against the actual implementation, trace, ledger, and the host's fresh
+                acceptance evidence. Report VERDICT plus PHASE A/B/C, all three required for pass. Do not sign off
+                on stale evidence and never impersonate the human confirmation.
+              complete: true
+          - id: dk-teamwork-auditor-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              read: true
+              write: false
+              edit: false
+              readImage: false
+              applyPatch: false
+          - id: dk-teamwork-auditor-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: dk-teamwork-auditor-policy
+            name: '@local/dk-dsh-teamwork/policy'
+            config:
+              role: auditor

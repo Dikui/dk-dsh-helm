@@ -1,0 +1,86 @@
+# /boost roles: one Host entrypoint and two isolated agent presets.
+#
+# The Host row is the `/boost` command entrypoint (package root export). It
+# reserves the reviewer child id, arms the reveal callback, and drives the
+# worker/reviewer run. The role rows live inside their presets and are scoped:
+# the Host and every existing preset keep their current tools.
+
+- insert:
+    - id: dk-boost-command
+      name: '@local/dk-dsh-boost'
+
+    - id: preset-dk-boost-worker
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: dk-boost-worker
+        name: Boost Worker
+        description: /boost implementation worker with files, search, and shell; no delegation, messaging, or history.
+        order: 20
+        plugins:
+          - id: dk-boost-worker-executor
+            name: '@deepseek-ai/dsh-tool-executor-native'
+
+          - id: dk-boost-worker-persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: |-
+                You are the implementation worker for one /boost task. Do the code work directly in the provided
+                working directory, using only the read, glob, grep, edit, write, and bash tools. You have no
+                delegation, messaging, session-history, web, scheduling, or goal tools; do not ask for them.
+
+                Read the task and the relevant code before editing, keep changes focused, and verify your work with
+                the available tests or commands. Finish with a concise report of what you changed, how you verified
+                it, and any remaining uncertainty. The orchestrator uses this report as the predecessor report for
+                the independent reviewer.
+              complete: true
+
+          - id: dk-boost-worker-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              readImage: false
+              applyPatch: false
+
+          - id: dk-boost-worker-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+
+          - id: dk-boost-worker-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            config:
+              enableRunInBackground: false
+              promoteOnTimeout: false
+
+          - id: dk-boost-worker-role
+            name: '@local/dk-dsh-boost/policy'
+            config:
+              role: worker
+
+    - id: preset-dk-boost-reviewer
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: dk-boost-reviewer
+        name: Boost Reviewer
+        description: /boost independent reviewer with only the dedicated boost_reveal tool.
+        order: 21
+        plugins:
+          - id: dk-boost-reviewer-executor
+            name: '@deepseek-ai/dsh-tool-executor-native'
+
+          - id: dk-boost-reviewer-persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: |-
+                You are the independent reviewer for one /boost task. You have exactly one tool: boost_reveal.
+                You have no file, shell, session-history, messaging, web, or delegation tools; rely only on the
+                task and selected evidence supplied in your prompt.
+
+                Before your final report, call boost_reveal exactly once with your non-empty initial verdict. After
+                the call succeeds, use the predecessor worker report it returns in your final review. The first
+                accepted verdict is locked, so do not call the tool again. Finish with a clear final verdict.
+              complete: true
+
+          - id: dk-boost-reviewer-role
+            name: '@local/dk-dsh-boost/policy'
+            config:
+              role: reviewer

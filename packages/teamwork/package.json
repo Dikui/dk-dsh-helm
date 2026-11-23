@@ -1,0 +1,9 @@
+{
+  "name":"@local/dk-dsh-teamwork", "version":"0.1.0", "private":true,
+  "description":"A specification-gated, independently audited team campaign for DeepSeek Harness.",
+  "type":"module", "license":"UNLICENSED", "engines":{"dsh":"0.2.2-rc.5"},
+  "main":"./index.js", "icon":"./icon.svg",
+  "exports":{".":"./index.js", "./policy":"./src/policy.js", "./icon":"./icon.svg", "./policy/icon":"./icon.svg", "./locale/*.json":"./locale/*.json", "./policy/locale/*.json":"./locale/policy/*.json", "./cordis.patch.yml":"./cordis.patch.yml", "./package.json":"./package.json"},
+  "files":["index.js","src","locale","icon.svg","cordis.patch.yml","README.md"],
+  "dependencies":{"zod":"4.6.6"},"dsh":{"bundle":{"patch":"./cordis.patch.yml"}}, "scripts":{"check":"node --check index.js && node --test test/*.test.js", "test":"node --test test/*.test.js"}
+}

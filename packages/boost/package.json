@@ -1,0 +1,10 @@
+{
+  "name": "@local/dk-dsh-boost", "version": "0.1.0", "private": true,
+  "description": "Run one implementation pass and a fresh evidence-first review in DeepSeek Harness.",
+  "type": "module", "license": "UNLICENSED", "engines": {"dsh": "0.2.2-rc.5"},
+  "main": "./index.js", "icon": "./icon.svg",
+  "exports": {".": "./index.js", "./policy": "./src/policy.js", "./reveal": "./src/reveal.js", "./icon": "./icon.svg", "./policy/icon": "./icon.svg", "./reveal/icon": "./icon.svg", "./locale/*.json": "./locale/*.json", "./policy/locale/*.json": "./locale/policy/*.json", "./reveal/locale/*.json": "./locale/reveal/*.json", "./cordis.patch.yml": "./cordis.patch.yml", "./package.json": "./package.json"},
+  "files": ["index.js", "src", "locale", "icon.svg", "cordis.patch.yml", "README.md"],
+  "dsh": {"bundle": {"patch": "./cordis.patch.yml"}},
+  "scripts": {"test": "node --test test/*.test.js"}
+}
