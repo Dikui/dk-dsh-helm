@@ -272,7 +272,7 @@ export function registerSwarmTools(host) {
     {
       name: 'read_board',
       description:
-        'Read Swarm board messages since your cursor. A normal read advances your cursor and clears delivered wakes; peek=true only inspects. The result includes resolved targets. Pages are sized by the rendered JSON: when hasMore is true, read again. A single legal post is always returned whole.',
+        'Read Swarm board messages since your cursor. A normal read advances your cursor and clears delivered wakes; peek=true only inspects. The result includes resolved targets. Pages are sized by the rendered JSON: when hasMore is true, continue with nextSince (normal reads) or nextSeqs (explicit seqs). A peek page never advances the cursor. A single legal post is always returned whole.',
       parameters: schema({
         since: { type: 'integer', minimum: 0, description: 'First sequence to include (default: your cursor).' },
         limit: { type: 'integer', minimum: 1, maximum: 200, description: 'Max messages (default 100).' },
@@ -286,9 +286,27 @@ export function registerSwarmTools(host) {
         try {
           const entry = host.ensureMember(exec.agent);
           await host.activateRoot(host.state.rootAgent(entry.rootId));
-          const result = await host.read(entry.rootId, exec.agent.id, args);
+          // A real DSH call carries a token and can be observed at
+          // tools/result. Preview the page first; advance the cursor only when
+          // the final content the model saw matches this page exactly. Peek and
+          // token-less direct calls keep their legacy non-deferred semantics.
+          const preview = args.peek !== true && exec?.token !== undefined && exec?.token !== null;
+          const result = await host.read(entry.rootId, exec.agent.id, {
+            ...args,
+            ...(preview ? { preview: true } : {}),
+          });
           if (!result.ok) throw failure(result.code, result.message);
-          return { ok: true, ...result };
+          const page = { ok: true, ...result };
+          if (preview) {
+            host.armReadDelivery({
+              token: exec.token,
+              rootId: entry.rootId,
+              agentId: exec.agent.id,
+              seqs: result.messages.map((message) => message.seq),
+              content: jsonExact(page),
+            });
+          }
+          return page;
         } catch (error) {
           return toolError(error);
         }

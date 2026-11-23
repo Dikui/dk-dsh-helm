@@ -523,6 +523,127 @@ test('read_board paginates by the rendered JSON and returns an oversized escaped
   assert.equal(empty.page.lastReadSeq, 3);
 });
 
+test('read_board commits only the confirmed page and repeats it after a blocked or rewritten delivery', async (t) => {
+  const rt = await setup();
+  t.after(() => rt.host.close());
+  const alice = await addAlice(rt);
+  registerSwarmTools(rt.host);
+  const tool = rt.tools.find((entry) => entry.definition.name === 'read_board').definition;
+  const agent = rt.agents.get(alice.sessionId);
+  const emit = (exec, result) =>
+    rt.events.find((event) => event.name === 'tools/result').handler(exec, result);
+  const cursor = () => rt.state.member('root', alice.sessionId).lastReadSeq;
+  const read = async (token, args = {}) => {
+    const exec = { name: 'read_board', agent, token, signal: new AbortController().signal };
+    const value = await tool.execute(args, exec);
+    const content = tool.output.render({}, value);
+    return { exec, value, content };
+  };
+
+  const first = 'a'.repeat(6144);
+  const second = 'b'.repeat(6144);
+  const third = 'c'.repeat(6144);
+  await rt.host.post('root', 'root', first);
+  await rt.host.post('root', 'root', second);
+
+  const blocked = await read('blocked');
+  assert.deepEqual(blocked.value.messages.map((message) => message.seq), [1]);
+  assert.equal(cursor(), 0, 'a preview does not move the cursor');
+  emit(blocked.exec, { isError: true, content: blocked.content });
+  await tick();
+  assert.equal(cursor(), 0, 'a blocked tool result is not confirmed');
+
+  const rewritten = await read('rewritten');
+  assert.deepEqual(rewritten.value.messages.map((message) => message.seq), [1], 'the page repeats, not skips');
+  emit(rewritten.exec, { isError: false, content: [{ type: 'text', text: 'policy rewrite' }] });
+  await tick();
+  assert.equal(cursor(), 0, 'rewritten content is not confirmed');
+
+  const wrongCaller = await read('wrong-caller');
+  emit({ ...wrongCaller.exec, agent: { id: 'someone-else' } }, {
+    isError: false,
+    content: wrongCaller.content,
+  });
+  await tick();
+  assert.equal(cursor(), 0, 'a result for another caller cannot confirm this page');
+
+  const dropped = await read('dropped');
+  assert.deepEqual(dropped.value.messages.map((message) => message.seq), [1]);
+  const recovered = await read('recovered-after-drop');
+  assert.deepEqual(
+    recovered.value.messages.map((message) => message.seq),
+    [1],
+    'a result that is never observed leaves the page to be read again',
+  );
+
+  const page1 = await read('page-1');
+  assert.deepEqual(page1.value.messages.map((message) => message.seq), [1]);
+  await rt.host.post('root', 'root', third);
+  emit(page1.exec, { isError: false, content: page1.content });
+  assert.equal(cursor(), 0, 'the commit is queued, not run inside the synchronous event');
+
+  const page2 = await read('page-2');
+  assert.equal(cursor(), 1, 'the next read waits for the prior page to commit');
+  assert.deepEqual(
+    page2.value.messages.map((message) => message.seq),
+    [2],
+    'the post published after the preview is not folded into the committed page',
+  );
+  emit(page2.exec, { isError: false, content: page2.content });
+  const page3 = await read('page-3');
+  assert.equal(cursor(), 2, 'the next read waits for page 2 to commit');
+  assert.deepEqual(page3.value.messages.map((message) => message.seq), [3]);
+
+  const peek = await read('peek', { peek: true, since: 0 });
+  assert.equal(peek.value.peek, true);
+  assert.equal(rt.host.pendingReads.has('peek'), false, 'peek is not armed for a commit');
+  emit(peek.exec, { isError: false, content: peek.content });
+  await tick();
+  assert.equal(cursor(), 2, 'a peek result never advances the cursor');
+});
+
+test('read_board leaves the cursor untouched when committing the delivered page fails', async (t) => {
+  const rt = await setup();
+  t.after(() => rt.host.close());
+  const alice = await addAlice(rt);
+  registerSwarmTools(rt.host);
+  const tool = rt.tools.find((entry) => entry.definition.name === 'read_board').definition;
+  const agent = rt.agents.get(alice.sessionId);
+  const emit = (exec, result) =>
+    rt.events.find((event) => event.name === 'tools/result').handler(exec, result);
+  const originalAct = rt.state.act.bind(rt.state);
+  let rejected = false;
+  rt.state.act = async (rootId, actorId, action) => {
+    if (!rejected && action.type === 'read' && action.preview !== true) {
+      rejected = true;
+      throw new Error('disk full');
+    }
+    return originalAct(rootId, actorId, action);
+  };
+
+  await rt.host.post('root', 'root', 'x'.repeat(6144));
+  const read = async (token) => {
+    const exec = { name: 'read_board', agent, token, signal: new AbortController().signal };
+    const value = await tool.execute({}, exec);
+    return { exec, value, content: tool.output.render({}, value) };
+  };
+
+  const first = await read('first');
+  emit(first.exec, { isError: false, content: first.content });
+  await rt.host.awaitReadCommit(alice.sessionId);
+  assert.equal(rt.state.member('root', alice.sessionId).lastReadSeq, 0, 'a failed commit is conservative');
+
+  const retry = await read('retry');
+  assert.deepEqual(
+    retry.value.messages.map((message) => message.seq),
+    [1],
+    'the reader repeats the undelivered page instead of skipping it',
+  );
+  emit(retry.exec, { isError: false, content: retry.content });
+  await rt.host.awaitReadCommit(alice.sessionId);
+  assert.equal(rt.state.member('root', alice.sessionId).lastReadSeq, 1);
+});
+
 test('resuming a paused active member keeps it stopped and wakeable, ignoring its stale activation', async (t) => {
   const gate = deferred();
   const rt = await setup({ activationResult: gate.promise });
@@ -633,6 +754,75 @@ test('finish reports a partial kill instead of claiming success', async (t) => {
   const board = rt.state.board('root');
   assert.equal(board.members[alice.sessionId].status, 'killed');
   assert.notEqual(board.members[bob.sessionId].status, 'killed');
+});
+
+test('finish reports an unconfirmed dispose instead of claiming success', async (t) => {
+  const rt = await setup();
+  t.after(() => rt.host.close());
+  const alice = await addAlice(rt);
+  registerSwarmCommands(rt.host);
+  const command = rt.commands[0];
+  const handle = rt.host.handles.get(alice.sessionId);
+  handle.dispose = async () => {
+    throw new Error('child is still running');
+  };
+
+  const out = await command.handler({
+    agent: rt.root,
+    rawInput: 'finish',
+    signal: new AbortController().signal,
+  });
+  assert.equal(out.kind, 'error', 'unconfirmed disposal must not be a success');
+  assert.match(out.text, /dispose unconfirmed|partial/i);
+  assert.match(out.text, /child is still running/);
+  assert.equal(rt.state.member('root', alice.sessionId).status, 'killed');
+});
+
+test('finish reports reservations it could not revoke instead of claiming success', async (t) => {
+  const rt = await setup();
+  t.after(() => rt.host.close());
+  registerSwarmCommands(rt.host);
+  const command = rt.commands[0];
+  const reserved = await rt.state.act('root', 'root', {
+    type: 'reserveJoin',
+    member: { sessionId: 'session-stuck', name: 'stuck', role: 'worker' },
+  });
+  assert.equal(reserved.result.ok, true);
+  const reservationId = reserved.result.reservationId;
+
+  const originalAct = rt.state.act.bind(rt.state);
+  rt.state.act = async (rootId, actorId, action) => {
+    if (action.type === 'failJoin') throw new Error('store refused the revocation');
+    return originalAct(rootId, actorId, action);
+  };
+
+  const out = await command.handler({
+    agent: rt.root,
+    rawInput: 'finish',
+    signal: new AbortController().signal,
+  });
+  assert.equal(out.kind, 'error');
+  assert.match(out.text, new RegExp(`reservation ${reservationId}: still open`));
+  assert.ok(rt.state.board('root').reservations[reservationId], 'the reservation is visibly still open');
+});
+
+test('concurrent finishes share one drain', async (t) => {
+  const rt = await setup();
+  t.after(() => rt.host.close());
+  const gate = deferred();
+  let calls = 0;
+  rt.host.runFinish = async () => {
+    calls += 1;
+    await gate.promise;
+    return { killed: [], failed: [], cancelled: 0 };
+  };
+  const first = rt.host.finish('root');
+  const second = rt.host.finish('root');
+  assert.equal(calls, 1, 'the second finish joins the running drain');
+  gate.resolve();
+  const [a, b] = await Promise.all([first, second]);
+  assert.deepEqual(a, b);
+  assert.equal(calls, 1);
 });
 
 test('finish waits for an in-flight add whose spawn ignores the signal, revokes it, and keeps the board open', async (t) => {

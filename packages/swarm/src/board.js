@@ -822,6 +822,7 @@ function resumeMember(draft, actor, action, now) {
   if (target.role === 'coordinator') return fail(ERRORS.FORBIDDEN, 'coordinator cannot be paused');
   if (!canManage(actor, target)) return fail(ERRORS.FORBIDDEN, 'cannot manage this member');
   if (target.status === 'killed') return fail(ERRORS.CLOSED, 'member is killed');
+  if (target.status !== 'paused') return ok({ member: memberView(draft, target) });
   // Pause released the real activation, so only a prior waiting/stopped state is
   // still true. Anything else must come back as stopped (wakeable on a mention),
   // never as active, or a later directed post has no running session to reach.
@@ -927,8 +928,11 @@ function postMessage(draft, actor, action, now) {
   return ok({ seq, message: messageView(post) }, wakes);
 }
 
-function readEnvelopeSize(result) {
-  return JSON.stringify({ ok: true, ...result }, null, 2).length;
+function indentMessageBlock(message) {
+  return JSON.stringify(message, null, 2)
+    .split('\n')
+    .map((line) => `    ${line}`)
+    .join('\n');
 }
 
 function readCursor(draft, member, readSeqs) {
@@ -949,6 +953,10 @@ function readCursor(draft, member, readSeqs) {
 
 function readBoard(draft, actor, action, now) {
   const peek = action.peek === true;
+  // A preview selects the exact page for a tool result that has not reached the
+  // model yet. It reports the cursor the page would produce without moving it;
+  // the host commits that page only after the runtime confirms the delivery.
+  const preview = !peek && action.preview === true;
   const sinceGiven = action.since === undefined ? null : action.since;
   if (sinceGiven !== null && (!Number.isInteger(sinceGiven) || sinceGiven < 0)) {
     return fail(ERRORS.INVALID_ARGUMENT, 'since must be a non-negative integer');
@@ -984,61 +992,73 @@ function readBoard(draft, actor, action, now) {
   }
   const candidates = visiblePostList(draft, actor, {
     since: seqs ? 0 : since,
-    limit,
     seqs,
     channel: action.channel,
   });
-  const envelope = (posts) => {
-    const messages = posts.map(messageView);
-    if (peek) {
-      return {
-        result: {
-          messages,
-          lastReadSeq: actor.lastReadSeq,
-          headSeq: draft.seq,
-          hasMore: false,
-          peek,
-        },
-      };
-    }
-    const readSeqs = new Set(messages.map((message) => message.seq));
-    const cursor = readCursor(draft, actor, readSeqs);
-    return {
-      cursor,
-      result: {
-        messages,
-        lastReadSeq: cursor,
-        headSeq: draft.seq,
-        hasMore: visiblePostList(draft, actor, { since: cursor, limit: 1 }).length > 0,
-        peek,
-      },
-    };
+  const views = candidates.map(messageView);
+  const blocks = views.map(indentMessageBlock);
+
+  // Size each page by the exact JSON the model sees. The provisional envelope
+  // uses the widest possible continuation metadata, so the selected page is a
+  // safe upper bound without serializing the whole result for every post.
+  const provisional = {
+    messages: [],
+    lastReadSeq: peek ? actor.lastReadSeq : draft.seq,
+    headSeq: draft.seq,
+    hasMore: true,
+    peek,
+    ...(seqs ? { nextSeqs: seqs } : { nextSince: draft.seq }),
   };
-
-  const page = [];
-  let built = envelope(page);
-  for (const post of candidates) {
-    const trial = [...page, post];
-    const rendered = envelope(trial);
-    if (page.length > 0 && readEnvelopeSize(rendered.result) > READ_RENDER_LIMIT) break;
-    page.push(post);
-    built = rendered;
-    if (readEnvelopeSize(rendered.result) > READ_RENDER_LIMIT) break;
+  const fixedBytes = JSON.stringify({ ok: true, ...provisional }, null, 2).length - 2;
+  const cap = Math.min(views.length, limit);
+  let take = 0;
+  let blockBytes = 0;
+  for (let index = 0; index < cap; index += 1) {
+    blockBytes += blocks[index].length;
+    const arrayBytes = 6 + blockBytes + 2 * index;
+    if (fixedBytes + arrayBytes > READ_RENDER_LIMIT) break;
+    take = index + 1;
   }
+  // A single legal post may exceed the budget after escaping. Return it whole
+  // and let the cursor advance; otherwise the reader could never retrieve it.
+  if (take === 0 && views.length > 0) take = 1;
 
-  if (peek) return ok(built.result);
+  const page = views.slice(0, take);
+  const hasMore = take < views.length;
+  const continuation = hasMore
+    ? seqs
+      ? { nextSeqs: views.slice(take).map((message) => message.seq) }
+      : { nextSince: page[page.length - 1].seq }
+    : {};
+  const result = {
+    messages: page,
+    lastReadSeq: peek ? actor.lastReadSeq : undefined,
+    headSeq: draft.seq,
+    hasMore,
+    peek,
+    ...continuation,
+  };
+  if (peek) return ok(result);
 
-  const cursor = built.cursor;
+  const cursor = readCursor(draft, actor, new Set(page.map((message) => message.seq)));
+  result.lastReadSeq = cursor;
+  if (preview) {
+    // No cursor, wake or status mutation: the page is not delivered yet.
+    result.peek = false;
+    return ok(result);
+  }
   actor.lastReadSeq = cursor;
   if (actor.status === 'waiting' || actor.status === 'stopped') {
     actor.status = 'active';
     actor.waitSince = 0;
   }
   actor.updatedAtSeq = now;
+  const delivered = new Set(page.map((message) => message.seq));
   draft.pendingWakes = draft.pendingWakes.filter(
-    (item) => item.sessionId !== actor.sessionId || item.seq > cursor,
+    (item) =>
+      item.sessionId !== actor.sessionId || (item.seq > cursor && !delivered.has(item.seq)),
   );
-  return ok(built.result);
+  return ok(result);
 }
 
 function waitForWake(draft, actor, action, now) {

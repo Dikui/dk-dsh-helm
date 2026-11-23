@@ -48,6 +48,11 @@ export class SwarmHost {
     this.retiredActivations = new WeakSet();
     this.inflightAdds = new Map();
     this.drains = new Map();
+    // A tool result can be blocked or rewritten after execute() returns. Keep
+    // the exact page until tools/result confirms the model saw it.
+    this.pendingReads = new Map();
+    this.readCommits = new Map();
+    this.pendingReadLimit = 512;
     this.remindedSeq = new Map();
     this.recentWakes = new Map();
     this.quotaFailures = new Map();
@@ -108,6 +113,8 @@ export class SwarmHost {
       }
     }
     this.handles.clear();
+    this.pendingReads.clear();
+    this.readCommits.clear();
     await this.store.close();
   }
 
@@ -122,6 +129,7 @@ export class SwarmHost {
     on('agent/turn-stopping', (payload) => this.turnStopping(payload));
     on('agent/request-error', (payload, next) => this.requestError(payload, next));
     on('agent/disposed', (payload) => this.agentDisposed(payload));
+    on('tools/result', (exec, result) => this.observeToolResult(exec, result));
   }
 
   async preStep(payload, next) {
@@ -337,6 +345,7 @@ export class SwarmHost {
       cancelled: false,
       reason: '',
       controller: null,
+      disposeError: null,
       done,
       resolve,
     };
@@ -367,81 +376,106 @@ export class SwarmHost {
   }
 
   async failJoin(rootId, reservationId, reason) {
-    if (!reservationId) return;
-    await this.state
-      .act(rootId, rootId, {
+    if (!reservationId) return true;
+    try {
+      const out = await this.state.act(rootId, rootId, {
         type: 'failJoin',
         reservationId,
         reason: oneLine(reason, 160),
-      })
-      .catch(() => {});
+      });
+      return out.result?.ok === true || out.result?.code === 'NOT_FOUND';
+    } catch (error) {
+      this.log('warn', `could not revoke reservation ${reservationId}`, error);
+      return false;
+    }
   }
 
-  async disposeActivation(activation) {
-    if (!activation) return;
+  async disposeActivation(activation, { rootId, sessionId } = {}) {
+    if (!activation) return { ok: true };
     this.retiredActivations.add(activation);
     try {
       await activation.dispose?.();
-    } catch {
-      // Compensation must continue even when dispose itself throws.
+      return { ok: true };
+    } catch (error) {
+      this.log('warn', `could not dispose activation${sessionId ? ` ${sessionId}` : ''}`, error);
+      // Interrupt is a weaker fallback: it may stop the child but does not
+      // confirm that the activation was disposed.
+      try {
+        this.ctx.subagents?.interrupt?.(sessionId, {
+          kind: 'ancestor',
+          agent: this.state.rootAgent(rootId),
+        });
+      } catch {
+        // Nothing else to try; the caller reports the failure.
+      }
+      return { ok: false, error };
     }
   }
 
   async failOpenReservations(rootId, reason) {
+    const remaining = [];
     const board = this.state.board(rootId);
     for (const reservationId of Object.keys(board?.reservations ?? {})) {
-      try {
-        await this.state.act(rootId, rootId, {
-          type: 'failJoin',
-          reservationId,
-          reason: oneLine(reason, 160),
-        });
-      } catch (error) {
-        this.log('warn', `could not revoke reservation ${reservationId}`, error);
+      if (!(await this.failJoin(rootId, reservationId, reason))) remaining.push(reservationId);
+    }
+    return remaining;
+  }
+
+  async runFinish(rootId) {
+    const killed = [];
+    const failed = [];
+    const guards = [...this.inflightAdds.values()].filter((guard) => guard.rootId === rootId);
+    for (const guard of guards) this.cancelInflightAdd(guard, 'swarm finish');
+    const unresolved = new Set(await this.failOpenReservations(rootId, 'swarm finish'));
+    await Promise.all(guards.map((guard) => guard.done));
+    for (const reservationId of await this.failOpenReservations(rootId, 'swarm finish')) {
+      unresolved.add(reservationId);
+    }
+    for (const guard of guards) {
+      if (guard.disposeError) {
+        failed.push(
+          `${guard.sessionId}: dispose unconfirmed: ${guard.disposeError instanceof Error ? guard.disposeError.message : String(guard.disposeError)}`,
+        );
       }
     }
+    const board = this.state.board(rootId);
+    for (const member of Object.values(board?.members ?? {})) {
+      if (member.role === 'coordinator' || member.status === 'killed') continue;
+      try {
+        const killedMember = await this.killMember(rootId, member.sessionId);
+        killed.push(killedMember?.name ?? member.name);
+      } catch (error) {
+        this.log('warn', `finish could not kill ${member.name}`, error);
+        failed.push(`${member.name}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    for (const reservationId of Object.keys(this.state.board(rootId)?.reservations ?? {})) {
+      unresolved.add(reservationId);
+    }
+    for (const reservationId of unresolved) {
+      failed.push(`reservation ${reservationId}: still open`);
+    }
+    return { killed, failed, cancelled: guards.length };
   }
 
   /**
    * Finish one root: cancel and drain every in-flight add, revoke seats that
    * never committed, then kill the remaining roster. New adds for this root are
    * refused only while the drain is active; the board itself stays readable and
-   * a later add succeeds.
+   * a later add succeeds. Concurrent calls share one drain.
    */
   async finish(rootId) {
     const running = this.drains.get(rootId);
-    if (running) await running.done.catch(() => {});
+    if (running) return running.promise;
     if (!this.state.board(rootId)) throw failure('NOT_MEMBER', 'no swarm board');
-    let settle;
-    const done = new Promise((resolve) => {
-      settle = resolve;
-    });
-    const drain = { done, resolve: settle };
+    const drain = {};
+    // Publish the drain before runFinish starts cancelling: an abort listener
+    // must not be able to slip a new add into this root mid-drain.
     this.drains.set(rootId, drain);
-    const killed = [];
-    const failed = [];
-    try {
-      const guards = [...this.inflightAdds.values()].filter((guard) => guard.rootId === rootId);
-      for (const guard of guards) this.cancelInflightAdd(guard, 'swarm finish');
-      await this.failOpenReservations(rootId, 'swarm finish');
-      await Promise.all(guards.map((guard) => guard.done));
-      await this.failOpenReservations(rootId, 'swarm finish');
-      const board = this.state.board(rootId);
-      for (const member of Object.values(board?.members ?? {})) {
-        if (member.role === 'coordinator' || member.status === 'killed') continue;
-        try {
-          const killedMember = await this.killMember(rootId, member.sessionId);
-          killed.push(killedMember?.name ?? member.name);
-        } catch (error) {
-          this.log('warn', `finish could not kill ${member.name}`, error);
-          failed.push(`${member.name}: ${error instanceof Error ? error.message : String(error)}`);
-        }
-      }
-      return { killed, failed, cancelled: guards.length };
-    } finally {
+    drain.promise = this.runFinish(rootId).finally(() => {
       if (this.drains.get(rootId) === drain) this.drains.delete(rootId);
-      settle();
-    }
+    });
+    return drain.promise;
   }
 
   async sharedCwd(rootAgent, signal) {
@@ -486,6 +520,17 @@ export class SwarmHost {
     let reservationId = null;
     let timer = null;
     let onAbort = null;
+    const clearSpawn = () => {
+      if (timer) clearTimeout(timer);
+      timer = null;
+      if (onAbort) signal?.removeEventListener?.('abort', onAbort);
+      onAbort = null;
+    };
+    const disposeSpawn = async () => {
+      if (!activation) return;
+      const disposed = await this.disposeActivation(activation, { rootId, sessionId });
+      if (!disposed.ok && !guard.disposeError) guard.disposeError = disposed.error;
+    };
     try {
       if (guard.cancelled) throw this.cancelledAdd(guard);
 
@@ -555,11 +600,8 @@ export class SwarmHost {
         if (typeof activation.result?.catch === 'function') activation.result.catch(() => {});
         if (guard.cancelled) throw this.cancelledAdd(guard);
       } catch (error) {
-        if (timer) clearTimeout(timer);
-        timer = null;
-        if (onAbort) signal?.removeEventListener?.('abort', onAbort);
-        onAbort = null;
-        await this.disposeActivation(activation);
+        clearSpawn();
+        await disposeSpawn();
         await this.failJoin(
           rootId,
           reservationId,
@@ -567,10 +609,7 @@ export class SwarmHost {
         );
         throw asHostError(error);
       }
-      clearTimeout(timer);
-      timer = null;
-      if (onAbort) signal?.removeEventListener?.('abort', onAbort);
-      onAbort = null;
+      clearSpawn();
 
       // The child can finish its first turn before commitJoin lands. Observe the
       // result only after the roster row exists, and suppress rejection until then
@@ -579,7 +618,7 @@ export class SwarmHost {
       try {
         committed = await this.state.act(rootId, rootId, { type: 'commitJoin', reservationId });
       } catch (error) {
-        await this.disposeActivation(activation);
+        await disposeSpawn();
         await this.failJoin(
           rootId,
           reservationId,
@@ -588,14 +627,14 @@ export class SwarmHost {
         throw asHostError(error);
       }
       if (!committed.result?.ok) {
-        await this.disposeActivation(activation);
+        await disposeSpawn();
         await this.failJoin(rootId, reservationId, `commit failed: ${committed.result?.code ?? 'unknown'}`);
         throw new HostError(committed.result?.code ?? 'COMMIT_FAILED', committed.result?.message ?? 'commit failed');
       }
       if (guard.cancelled) {
         // finish accepted the add while its commit was landing. Tear the member
         // down here, before this call returns, so no worker can keep running.
-        await this.disposeActivation(activation);
+        await disposeSpawn();
         await this.state.act(rootId, rootId, { type: 'kill', target: sessionId }).catch(() => {});
         throw this.cancelledAdd(guard);
       }
@@ -612,8 +651,7 @@ export class SwarmHost {
       }
       return { member: committed.result.member, sessionId, handle: activation };
     } finally {
-      if (timer) clearTimeout(timer);
-      if (onAbort) signal?.removeEventListener?.('abort', onAbort);
+      clearSpawn();
       this.endInflightAdd(guard);
     }
   }
@@ -694,19 +732,26 @@ export class SwarmHost {
     if (!out.result?.ok) throw new HostError(out.result?.code ?? 'MANAGE_FAILED', out.result?.message ?? `${type} failed`);
     if (type === 'kill' || type === 'pause') {
       const handle = this.handles.get(member.sessionId);
+      let disposeFailure = null;
       if (handle) {
         this.retiredActivations.add(handle);
-        this.handles.delete(member.sessionId);
-        try {
-          await handle.dispose?.();
-        } catch {
-          // A killed member's child may already be gone.
-        }
+        const disposed = await this.disposeActivation(handle, {
+          rootId,
+          sessionId: member.sessionId,
+        });
+        if (disposed.ok) this.handles.delete(member.sessionId);
+        else disposeFailure = disposed.error;
       }
       try {
         this.ctx.subagents?.interrupt?.(member.sessionId, { kind: 'ancestor', agent: this.state.rootAgent(rootId) });
       } catch {
         // A member that is not live has nothing to interrupt.
+      }
+      if (disposeFailure) {
+        throw failure(
+          'DISPOSE_FAILED',
+          `member ${member.name} was stopped in the roster, but its activation could not be disposed: ${disposeFailure instanceof Error ? disposeFailure.message : String(disposeFailure)}`,
+        );
       }
     } else if (type === 'resume') {
       this.quotaFailures.delete(member.sessionId);
@@ -812,7 +857,92 @@ export class SwarmHost {
     return out.result;
   }
 
+  // Remember the exact page (and rendered content) behind a tool result token.
+  // Bounded so a policy that drops tools/result cannot grow memory forever.
+  armReadDelivery({ token, rootId, agentId, seqs, content }) {
+    if (token === undefined || token === null) return false;
+    if (this.pendingReads.size >= this.pendingReadLimit) {
+      const oldest = this.pendingReads.keys().next().value;
+      this.pendingReads.delete(oldest);
+    }
+    this.pendingReads.set(token, {
+      token,
+      rootId,
+      agentId,
+      seqs: [...seqs],
+      content: Array.isArray(content) ? content.map((part) => ({ ...part })) : content,
+      at: nowMs(),
+    });
+    return true;
+  }
+
+  // tools/result is emitted synchronously and is not awaited by the runtime.
+  // The commit is therefore queued here, keyed to the actor, and every later
+  // read for that actor waits for the queue before selecting a new page.
+  observeToolResult(exec, result) {
+    const token = exec?.token;
+    if (token === undefined || token === null) return false;
+    const pending = this.pendingReads.get(token);
+    if (!pending) return false;
+    if (exec.name !== 'read_board' || exec.agent?.id !== pending.agentId) return false;
+    this.pendingReads.delete(token);
+    if (result?.isError !== false) return false;
+    const delivered = JSON.stringify(result.content);
+    const expected = JSON.stringify(pending.content);
+    if (delivered !== expected) {
+      this.log('warn', `read_board result for ${pending.agentId} was rewritten; cursor stays put`);
+      return false;
+    }
+    this.queueReadCommit(pending);
+    return true;
+  }
+
+  queueReadCommit(record) {
+    const previous = this.readCommits.get(record.agentId) ?? Promise.resolve();
+    const job = previous.catch(() => {}).then(() => this.commitRead(record));
+    this.readCommits.set(record.agentId, job);
+    job.then(
+      () => {
+        if (this.readCommits.get(record.agentId) === job) this.readCommits.delete(record.agentId);
+      },
+      (error) => {
+        if (this.readCommits.get(record.agentId) === job) this.readCommits.delete(record.agentId);
+        this.log('warn', `could not commit delivered read for ${record.agentId}`, error);
+      },
+    );
+    return job;
+  }
+
+  async awaitReadCommit(agentId) {
+    const pending = this.readCommits.get(agentId);
+    if (!pending) return;
+    try {
+      await pending;
+    } catch {
+      // The failed commit left the cursor untouched; the next read repeats the
+      // same page instead of skipping it.
+    }
+  }
+
+  async commitRead(record) {
+    // Re-select nothing: commit exactly the page the model received. The core
+    // recomputes the continuous cursor at commit time, so a missing page can
+    // never be jumped over.
+    const out = await this.state.act(record.rootId, record.agentId, {
+      type: 'read',
+      seqs: record.seqs,
+    });
+    if (!out.result?.ok) {
+      throw failure(
+        out.result?.code ?? 'INVALID_STATE',
+        out.result?.message ?? 'could not commit the delivered read page',
+      );
+    }
+    return out.result;
+  }
+
   async read(rootId, agentId, options = {}) {
+    await this.awaitReadCommit(agentId);
     return (
       await this.state.act(rootId, agentId, {
         type: 'read',
@@ -821,6 +951,7 @@ export class SwarmHost {
         ...(Array.isArray(options.seqs) ? { seqs: options.seqs } : {}),
         ...(options.channel ? { channel: options.channel } : {}),
         ...(options.peek ? { peek: true } : {}),
+        ...(options.preview ? { preview: true } : {}),
       })
     ).result;
   }

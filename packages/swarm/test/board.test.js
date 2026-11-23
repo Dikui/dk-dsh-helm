@@ -482,6 +482,75 @@ test('a single post whose escaped rendering exceeds the limit is still returned 
   assert.equal(again.result.lastReadSeq, 1);
 });
 
+test('peek reports a same-query continuation without advancing the cursor', () => {
+  let board = addWorker(seedBoard()).state;
+  const first = 'a'.repeat(6000);
+  const second = 'b'.repeat(6000);
+  board = transition(board, COORD, { type: 'post', text: first }).state;
+  board = transition(board, COORD, { type: 'post', text: second }).state;
+
+  const peek = transition(board, WORKER, { type: 'read', peek: true, since: 0 });
+  assert.deepEqual(peek.result.messages.map((m) => m.seq), [1]);
+  assert.equal(peek.result.hasMore, true);
+  assert.equal(peek.result.nextSince, 1);
+  assert.equal(peek.result.lastReadSeq, 0, 'peek never advances the cursor');
+  assert.equal(peek.state.members[WORKER].lastReadSeq, 0);
+
+  const peekAgain = transition(peek.state, WORKER, { type: 'read', peek: true, since: 0 });
+  assert.deepEqual(peekAgain.result.messages.map((m) => m.seq), [1], 'peek repeats the same page');
+  const next = transition(peekAgain.state, WORKER, {
+    type: 'read',
+    since: peekAgain.result.nextSince,
+  });
+  assert.deepEqual(next.result.messages.map((m) => m.seq), [2]);
+});
+
+test('channel-filtered reads continue at the page tail', () => {
+  let board = addWorker(seedBoard()).state;
+  board = transition(board, COORD, { type: 'channel', op: 'create', channel: 'ops' }).state;
+  board = transition(board, COORD, {
+    type: 'channel',
+    op: 'subscribe',
+    channel: 'ops',
+    members: [WORKER],
+  }).state;
+  const ops1 = '1'.repeat(6000);
+  const ops2 = '2'.repeat(6000);
+  board = transition(board, COORD, { type: 'post', text: ops1, channel: 'ops' }).state;
+  board = transition(board, COORD, { type: 'post', text: 'main post' }).state;
+  board = transition(board, COORD, { type: 'post', text: ops2, channel: 'ops' }).state;
+
+  const first = transition(board, WORKER, { type: 'read', channel: 'ops' });
+  assert.deepEqual(first.result.messages.map((m) => m.seq), [3]);
+  assert.equal(first.result.hasMore, true);
+  assert.equal(first.result.nextSince, 3);
+  const second = transition(first.state, WORKER, {
+    type: 'read',
+    channel: 'ops',
+    since: first.result.nextSince,
+  });
+  assert.deepEqual(second.result.messages.map((m) => m.seq), [5], 'no main-channel post is mixed in');
+  assert.equal(second.result.hasMore, false);
+});
+
+test('explicit seqs continue with the remaining seqs instead of repeating', () => {
+  let board = addWorker(seedBoard()).state;
+  for (const prefix of ['a', 'b', 'c']) {
+    board = transition(board, COORD, { type: 'post', text: prefix.repeat(6000) }).state;
+  }
+  const first = transition(board, WORKER, { type: 'read', seqs: [1, 2, 3] });
+  assert.deepEqual(first.result.messages.map((m) => m.seq), [1]);
+  assert.equal(first.result.hasMore, true);
+  assert.deepEqual(first.result.nextSeqs, [2, 3]);
+  assert.equal(first.result.lastReadSeq, 1, 'seq 1 was delivered, so the cursor reaches it');
+  const second = transition(first.state, WORKER, {
+    type: 'read',
+    seqs: first.result.nextSeqs,
+  });
+  assert.deepEqual(second.result.messages.map((m) => m.seq), [2]);
+  assert.deepEqual(second.result.nextSeqs, [3]);
+});
+
 test('read hides channels the member cannot see', () => {
   let board = addWorker(seedBoard()).state;
   board = addWorker(board, 'session-worker-2', 'worker-2').state;
@@ -1099,15 +1168,16 @@ test('rate limits expire at the window boundary and failed controls are atomic',
   assert.deepEqual(denied.state.channels.ops.subscribers, [COORD]);
 });
 
-test('read reports hasMore from the cursor, not from the last requested seq', () => {
+test('read keeps hasMore scoped to the same explicit-seq query', () => {
   let board = addWorker(seedBoard()).state;
   for (const text of ['one', 'two', 'three']) {
     board = transition(board, COORD, { type: 'post', text }).state;
   }
   const jumped = transition(board, 'session-worker-1', { type: 'read', seqs: [3] });
   assert.deepEqual(jumped.result.messages.map((message) => message.seq), [3]);
-  assert.equal(jumped.result.lastReadSeq, 0);
-  assert.equal(jumped.result.hasMore, true);
+  assert.equal(jumped.result.lastReadSeq, 0, 'a jumped seq cannot skip unread seq 1');
+  assert.equal(jumped.result.hasMore, false, 'the explicit seq query has no continuation');
+  assert.equal(jumped.result.nextSeqs, undefined);
   assertFailure(
     transition(board, WORKER, { type: 'read', channel: 'missing' }),
     ERRORS.UNKNOWN_CHANNEL,
@@ -1139,6 +1209,15 @@ test('resume restores the status the member had before pausing', () => {
   const pausedAgain = transition(stopped, COORD, { type: 'pause', target: WORKER }).state;
   const resumedAgain = transition(pausedAgain, COORD, { type: 'resume', target: WORKER });
   assert.equal(resumedAgain.state.members[WORKER].status, 'stopped');
+});
+
+test('resuming a member that is not paused is an idempotent control', () => {
+  const board = addWorker(seedBoard()).state;
+  const resumed = transition(board, COORD, { type: 'resume', target: WORKER });
+  assert.equal(resumed.result.ok, true);
+  assert.equal(resumed.state.members[WORKER].status, 'active', 'a live worker stays active');
+  assert.deepEqual(resumed.wakes, [], 'resume must not schedule a duplicate wake');
+  assert.deepEqual(transition(board, COORD, { type: 'post', text: 'hello @worker-1' }).wakes, []);
 });
 
 test('resuming a paused active member leaves it wakeable instead of optimistically active', () => {
