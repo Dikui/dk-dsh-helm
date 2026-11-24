@@ -9,10 +9,27 @@ import {
 } from './host-format.js';
 import { buildPublicView } from './host-view.js';
 import { startStallMonitor } from './stall-monitor.js';
+import {
+  ROUTE_ERRORS,
+  agentModelRoute,
+  assertRouteAllowed,
+  assertRouteAvailable,
+  modelRouteLabel,
+  normalizeModelRoute,
+  sameModelRoute,
+} from './model-routes.js';
+import { readQuotaAdvisory } from './quota-advisory.js';
 
 const SPAWN_TIMEOUT_MS = 120_000;
 const RESERVATION_TTL_MS = 120_000;
 const GUARD_INTERVAL_MS = 60_000;
+// A fallback route is claimed and verified once; a hung provider check must not
+// hold the member in limbo.
+const SWITCH_TIMEOUT_MS = 5_000;
+// The current turn must end before the continuation can be sent to the same
+// session. If it never becomes idle, pause rather than leave a half-switched
+// member running under an unconfirmed route.
+const SWITCH_CONTINUATION_TIMEOUT_MS = 60_000;
 
 function nowMs() {
   return Date.now();
@@ -28,6 +45,38 @@ function isQuotaFailure(failureValue) {
   return /rate.?limit|429|quota|insufficient_quota|resource.?exhausted|too many requests/i.test(
     String(text ?? ''),
   );
+}
+
+/**
+ * Extract the provider failure code when it specifically means an exhausted
+ * balance. Rate limits stay on the bounded retry/pause path; only an account
+ * or route quota is eligible for a one-time fallback switch.
+ * @param {unknown} failureValue - `agent/request-error` failure payload.
+ * @returns {'QUOTA' | 'ACCOUNT_QUOTA' | null} exhaustion kind, or null.
+ */
+function quotaFailureKind(failureValue) {
+  let value = failureValue;
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      value = undefined;
+    }
+  }
+  let code = typeof value?.code === 'string' ? value.code : '';
+  if (!code) {
+    let text;
+    try {
+      text = JSON.stringify(failureValue);
+    } catch {
+      text = String(failureValue);
+    }
+    code = /"code"\s*:\s*"([A-Za-z_]+)"/.exec(String(text ?? ''))?.[1] ?? '';
+  }
+  const normalized = code.toUpperCase();
+  if (normalized === 'ACCOUNT_QUOTA' || normalized === 'INSUFFICIENT_QUOTA') return 'ACCOUNT_QUOTA';
+  if (normalized === 'QUOTA') return 'QUOTA';
+  return null;
 }
 
 /**
@@ -59,6 +108,10 @@ export class SwarmHost {
     this.remindedSeq = new Map();
     this.recentWakes = new Map();
     this.quotaFailures = new Map();
+    // Member session id -> in-progress fallback switch. One switch per member:
+    // duplicate request-error retries are suppressed instead of claiming twice.
+    this.switching = new Map();
+    this.switchContinuationTimeoutMs = SWITCH_CONTINUATION_TIMEOUT_MS;
     this.activated = new Set();
     this.off = [];
     this.interval = null;
@@ -116,6 +169,10 @@ export class SwarmHost {
       }
     }
     this.handles.clear();
+    for (const record of this.switching.values()) {
+      if (record?.timer) clearTimeout(record.timer);
+    }
+    this.switching.clear();
     this.pendingReads.clear();
     this.readCommits.clear();
     await this.store.close();
@@ -196,27 +253,41 @@ export class SwarmHost {
         const agent = payload?.agent;
         const entry = agent ? this.state.resolve(agent) : null;
         if (entry && !entry.isRoot && entry.self) {
-          const count = (this.quotaFailures.get(agent.id) ?? 0) + 1;
-          this.quotaFailures.set(agent.id, count);
-          if (entry.self.status === 'paused' || entry.self.status === 'killed') {
-            // The threshold already parked this member. Do not let an
-            // `always` retry policy start it again.
+          const member = entry.self;
+          const kind = quotaFailureKind(payload?.failure);
+          if (
+            member.status === 'paused'
+            || member.status === 'killed'
+            || this.switching.has(member.sessionId)
+          ) {
+            // Either the threshold already parked this member, or a fallback
+            // switch is in flight. Suppress the retry exactly once and never
+            // claim the same fallback twice.
             stopRetry = true;
-          } else if (count >= 3) {
-            const out = await this.state.act(entry.rootId, entry.rootId, {
-              type: 'pause',
-              target: entry.self.sessionId,
-              reason: 'repeated quota/rate-limit errors',
-            });
-            if (out.result?.ok) {
-              stopRetry = true;
-              await this.steerRoot(
-                entry.rootId,
-                `[Swarm] Paused "${entry.self.name}" after ${count} quota/rate-limit errors. Inspect with /swarm status, then "resume ${entry.self.name}".`,
-                'Swarm member paused after quota errors',
-              ).catch(() => {});
-            } else {
-              this.log('warn', `pause ${entry.self.name} failed: ${out.result?.code}`);
+          } else if (kind) {
+            // Provider-neutral QUOTA / first-party ACCOUNT_QUOTA: try the one
+            // configured fallback, otherwise park immediately. Repeated rate
+            // limiting (below) keeps its bounded threshold.
+            stopRetry = await this.handleExhaustedQuota(agent, entry, kind);
+          } else {
+            const count = (this.quotaFailures.get(agent.id) ?? 0) + 1;
+            this.quotaFailures.set(agent.id, count);
+            if (count >= 3) {
+              const out = await this.state.act(entry.rootId, entry.rootId, {
+                type: 'pause',
+                target: member.sessionId,
+                reason: 'repeated quota/rate-limit errors',
+              });
+              if (out.result?.ok) {
+                stopRetry = true;
+                await this.steerRoot(
+                  entry.rootId,
+                  `[Swarm] Paused "${member.name}" after ${count} quota/rate-limit errors. Inspect with /swarm status, then "resume ${member.name}".`,
+                  'Swarm member paused after quota errors',
+                ).catch(() => {});
+              } else {
+                this.log('warn', `pause ${member.name} failed: ${out.result?.code}`);
+              }
             }
           }
         }
@@ -227,9 +298,309 @@ export class SwarmHost {
     // Exactly once. A failed next() must propagate to the host, not be retried.
     const action = await next();
     // Returning undefined prevents the configured retry policy from running
-    // again after the member has been parked.
+    // again after the member has been parked or a switch was started.
     if (stopRetry) return undefined;
     return action;
+  }
+
+  /**
+   * One provider route is exhausted. Claim the member's fallback when it can be
+   * authorized and consumed; otherwise park safely. Never throws into the host
+   * event chain: a guard failure must not crash the turn.
+   * @param {any} agent - live member agent reporting the error.
+   * @param {{rootId: string, self: any}} entry - resolved member.
+   * @param {'QUOTA' | 'ACCOUNT_QUOTA'} kind - exhaustion kind.
+   * @returns {Promise<boolean>} true when the retry must be suppressed.
+   */
+  async handleExhaustedQuota(agent, entry, kind) {
+    if (entry.self.fallbackRoute) {
+      return this.tryQuotaSwitch(agent, entry, kind);
+    }
+    await this.pauseQuotaMember(entry, `${kind} exhausted and no fallback route is available`);
+    return true;
+  }
+
+  /**
+   * Switch one live member's next work to its authorized fallback route while
+   * keeping the same child session. Sequence: authorize -> consume the durable
+   * fallback (single transition, so a duplicate cannot claim twice) -> select
+   * the model on the live agent -> confirm the board route -> wait for the
+   * interrupted turn to end -> send the continuation into the same session.
+   * @param {any} agent - live member agent.
+   * @param {{rootId: string, self: any}} entry - resolved member.
+   * @param {'QUOTA' | 'ACCOUNT_QUOTA'} kind - exhaustion kind.
+   * @returns {Promise<boolean>} always true (suppress the in-place retry).
+   */
+  async tryQuotaSwitch(agent, entry, kind) {
+    const member = entry.self;
+    const memberId = member.sessionId;
+    if (this.switching.has(memberId)) return true;
+    const record = { startedAt: nowMs(), timer: null };
+    this.switching.set(memberId, record);
+    const signal = AbortSignal.any([this.lifecycle.signal, AbortSignal.timeout(SWITCH_TIMEOUT_MS)]);
+    try {
+      const rootAgent = this.state.rootAgent(entry.rootId);
+      if (!rootAgent) throw failure('ROOT_UNAVAILABLE', 'the Swarm root agent is not live');
+      // Re-check authorization at switch time: the durable policy may have
+      // changed after dispatch, and a fallback is an explicit child route.
+      const route = await this.validateRoute(member.fallbackRoute, {
+        rootAgent,
+        signal,
+        label: 'fallback route',
+      });
+      const expect = member.modelRoute
+        ? normalizeModelRoute(member.modelRoute, 'model route')
+        : undefined;
+      const out = await this.state.act(entry.rootId, entry.rootId, {
+        type: 'consumeFallback',
+        target: memberId,
+        ...(expect ? { expect } : {}),
+      });
+      if (out.result?.ok !== true) {
+        throw failure(
+          out.result?.code ?? 'FALLBACK_UNAVAILABLE',
+          out.result?.message ?? 'the fallback route could not be claimed',
+        );
+      }
+      const claimed = normalizeModelRoute(out.result.route ?? route, 'fallback route');
+      // Authorization is checked again immediately before the session route
+      // changes; consuming a fallback is not itself proof of authorization.
+      assertRouteAllowed(claimed, { rootAgent, label: 'fallback route' });
+      if (typeof agent.model?.select !== 'function') {
+        throw failure(ROUTE_ERRORS.UNAVAILABLE, 'this host cannot change a live member model');
+      }
+      // Durable for the session: the same child resumes on this route.
+      agent.model.select({ provider: claimed.provider, model: claimed.model });
+      this.log('info', `member "${member.name}" switch to ${modelRouteLabel(claimed)} after ${kind}`);
+      await this.confirmMemberRoute(entry, claimed);
+      this.scheduleSwitchContinuation(agent, entry, claimed);
+      return true;
+    } catch (error) {
+      this.clearSwitch(memberId);
+      await this.pauseQuotaMember(
+        entry,
+        `the switch after ${kind} failed: ${oneLine(asHostError(error).message, 200)}`,
+      );
+      return true;
+    }
+  }
+
+  /**
+   * Reflect an already-selected route on the board without the ordinary
+   * busy guard. Failure here is logged, not fatal: the session route is already
+   * durable and the continuation still has to run.
+   * @param {{rootId: string, self: any}} entry - resolved member.
+   * @param {{provider: string, model: string}} route - selected route.
+   * @returns {Promise<void>} resolves after the board attempt.
+   */
+  async confirmMemberRoute(entry, route) {
+    try {
+      const out = await this.state.act(entry.rootId, entry.rootId, {
+        type: 'setModel',
+        target: entry.self.sessionId,
+        modelRoute: route,
+        confirmedSwitch: true,
+      });
+      if (out.result?.ok === false) {
+        this.log('warn', `setModel ${entry.self.name} rejected after switch: ${out.result.code}`);
+      }
+    } catch (error) {
+      this.log('warn', `setModel ${entry.self.name} failed after switch`, error);
+    }
+  }
+
+  /**
+   * Wait for the interrupted turn to finish, then continue the same session.
+   * The timeout guards against a turn that never returns to idle.
+   * @param {any} agent - live member agent.
+   * @param {{rootId: string, self: any}} entry - resolved member.
+   * @param {{provider: string, model: string}} route - selected fallback route.
+   * @returns {void}
+   */
+  scheduleSwitchContinuation(agent, entry, route) {
+    const memberId = entry.self.sessionId;
+    if (typeof agent.whenIdle !== 'function') {
+      this.clearSwitch(memberId);
+      void this.pauseQuotaMember(entry, 'this host cannot wait for the interrupted turn before continuing');
+      return;
+    }
+    const record = this.switching.get(memberId);
+    if (record) {
+      record.timer = setTimeout(() => {
+        if (!this.switching.has(memberId)) return;
+        this.clearSwitch(memberId);
+        void this.pauseQuotaMember(entry, 'the member did not become idle after the model switch');
+      }, Math.max(1, this.switchContinuationTimeoutMs));
+      record.timer.unref?.();
+    }
+    void Promise.resolve(agent.whenIdle())
+      .then(() => this.continueAfterSwitch(entry, route))
+      .catch(() => {
+        this.clearSwitch(memberId);
+        return this.pauseQuotaMember(entry, 'waiting for the member turn to finish failed');
+      });
+  }
+
+  /**
+   * Send the continuation into the SAME child session after the route switch.
+   * Re-authorizes the route against the current root policy first, and pauses
+   * rather than leave a killed/paused or unauthorized member running.
+   * @param {{rootId: string, self: any}} entry - resolved member.
+   * @param {{provider: string, model: string}} route - selected fallback route.
+   * @returns {Promise<void>} resolves after the continuation is sent or the member is parked.
+   */
+  async continueAfterSwitch(entry, route) {
+    const memberId = entry.self.sessionId;
+    try {
+      if (this.disposed || this.lifecycle.signal.aborted) return;
+      const board = this.state.board(entry.rootId);
+      const member = board?.members?.[memberId];
+      if (!member || member.status === 'killed' || member.status === 'paused') {
+        // A human pause/kill during the switch wins; keep the member parked.
+        return;
+      }
+      const rootAgent = this.state.rootAgent(entry.rootId);
+      if (!rootAgent) throw failure('ROOT_UNAVAILABLE', 'the Swarm root agent is not live');
+      // The root allowlist can change while the member finishes its turn.
+      assertRouteAllowed(route, { rootAgent, label: 'fallback route' });
+      const text = [
+        `[Swarm] Your previous model route was exhausted (${modelRouteLabel(route)} is now active).`,
+        'This is the same member session and the same task: continue from the interrupted step instead of restarting it.',
+      ].join(' ');
+      if (typeof this.sendMember === 'function') {
+        await this.sendMember(rootAgent, memberId, [{ type: 'text', text }], {
+          signal: this.lifecycle.signal,
+        });
+      } else if (typeof this.ctx.subagents?.sendMessage === 'function') {
+        await this.ctx.subagents.sendMessage(rootAgent, memberId, [{ type: 'text', text }], {
+          signal: this.lifecycle.signal,
+        });
+      } else {
+        throw failure(
+          ROUTE_ERRORS.UNAVAILABLE,
+          'this host cannot send a continuation to a member session',
+        );
+      }
+      this.quotaFailures.delete(memberId);
+      await this.steerRoot(
+        entry.rootId,
+        `[Swarm] Switched "${member.name}" to ${modelRouteLabel(route)} after quota exhaustion and resumed the same session.`,
+        'Swarm member switched model route and resumed',
+      ).catch(() => {});
+    } catch (error) {
+      await this.pauseQuotaMember(
+        entry,
+        `the switched member could not continue: ${oneLine(asHostError(error).message, 200)}`,
+      );
+    } finally {
+      this.clearSwitch(memberId);
+    }
+  }
+
+  /** Release the in-flight switch marker and its idle timeout. */
+  clearSwitch(memberId) {
+    const record = this.switching.get(memberId);
+    if (record?.timer) clearTimeout(record.timer);
+    this.switching.delete(memberId);
+  }
+
+  /**
+   * Park one member without touching its session. Safe to call twice.
+   * @param {{rootId: string, self: any}} entry - resolved member.
+   * @param {string} reason - human reason shown to the root.
+   * @returns {Promise<boolean>} true when the pause transition succeeded.
+   */
+  async pauseQuotaMember(entry, reason) {
+    const member = entry.self;
+    if (!member || member.status === 'paused' || member.status === 'killed') return false;
+    try {
+      const out = await this.state.act(entry.rootId, entry.rootId, {
+        type: 'pause',
+        target: member.sessionId,
+        reason,
+      });
+      if (out.result?.ok) {
+        await this.steerRoot(
+          entry.rootId,
+          `[Swarm] Paused "${member.name}" (${reason}). The member session and progress are kept; inspect with /swarm status, then "resume ${member.name}".`,
+          'Swarm member paused for quota',
+        ).catch(() => {});
+        return true;
+      }
+      this.log('warn', `pause ${member.name} rejected: ${out.result?.code}`);
+    } catch (error) {
+      this.log('warn', `pause ${member.name} failed`, error);
+    }
+    return false;
+  }
+
+  /**
+   * Validate one explicit child route against the root Session allowlist and
+   * the installed provider registration.
+   * @param {{provider: string, model: string}|string} route - candidate route.
+   * @param {{rootAgent: any, signal?: AbortSignal, label?: string}} options - live root and cancellation.
+   * @returns {Promise<{provider: string, model: string}>} the normalized, authorized route.
+   */
+  async validateRoute(route, { rootAgent, signal, label = 'model route' } = {}) {
+    const normalized = normalizeModelRoute(route, label);
+    if (!normalized) throw failure(ROUTE_ERRORS.INVALID, `${label} is required`);
+    assertRouteAllowed(normalized, { rootAgent, label });
+    await assertRouteAvailable(this.llmService(), normalized, { signal, label });
+    return normalized;
+  }
+
+  /**
+   * Validate the primary/fallback pair for one dispatch. Called by the entry
+   * layer before spawn so an unauthorized or unregistered route never reaches a
+   * child.
+   * @param {{provider: string, model: string}|undefined|null} primary - requested primary route.
+   * @param {{provider: string, model: string}|undefined|null} fallback - requested fallback route.
+   * @param {{rootAgent: any, signal?: AbortSignal}} options - live root and cancellation.
+   * @returns {Promise<{primary: {provider: string, model: string}|null, fallback: {provider: string, model: string}|null}>} normalized routes.
+   */
+  async validateDispatchRoutes(primary, fallback, { rootAgent, signal } = {}) {
+    let primaryRoute = normalizeModelRoute(primary, 'primary route');
+    let fallbackRoute = normalizeModelRoute(fallback, 'fallback route');
+    if (!primaryRoute && !fallbackRoute) return { primary: null, fallback: null };
+    if (!rootAgent) {
+      throw failure(ROUTE_ERRORS.POLICY_UNAVAILABLE, 'the Swarm root agent is not live');
+    }
+    if (!primaryRoute) {
+      primaryRoute = agentModelRoute(rootAgent);
+      if (!primaryRoute) {
+        throw failure(
+          ROUTE_ERRORS.POLICY_UNAVAILABLE,
+          'the root Session has no current provider/model route to inherit',
+        );
+      }
+    }
+    if (fallbackRoute && sameModelRoute(primaryRoute, fallbackRoute)) {
+      throw failure(ROUTE_ERRORS.INVALID, 'fallback route must differ from the primary route');
+    }
+    await this.validateRoute(primaryRoute, { rootAgent, signal, label: 'primary route' });
+    if (fallbackRoute) {
+      await this.validateRoute(fallbackRoute, { rootAgent, signal, label: 'fallback route' });
+    }
+    return { primary: primaryRoute, fallback: fallbackRoute };
+  }
+
+  /**
+   * Trusted account-balance advisory. Exact wallet amounts only; hosts without
+   * the optional DeepSeek account service report `supported: false`.
+   * @param {{signal?: AbortSignal}} [options] - cancellation.
+   * @returns {Promise<{supported: boolean, signedIn: boolean|null, balances: any[]|null, reason?: string}>} snapshot.
+   */
+  async quotaAdvisory({ signal } = {}) {
+    return readQuotaAdvisory(this.ctx, { signal });
+  }
+
+  /** The optional LLM service, without a hard Cordis injection. */
+  llmService() {
+    try {
+      return this.ctx?.get?.('llm') ?? this.ctx?.llm ?? null;
+    } catch {
+      return null;
+    }
   }
 
   agentDisposed(payload) {
