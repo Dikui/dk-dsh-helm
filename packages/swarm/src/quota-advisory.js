@@ -22,12 +22,10 @@ const ABORTED = Symbol('balance-aborted')
  */
 export function accountService(ctx) {
   try {
-    const service = ctx?.get?.('deepseekAccount')
-    if (service) return service
+    return (typeof ctx?.get === 'function' ? ctx.get('deepseekAccount') : ctx?.deepseekAccount) ?? null
   } catch {
-    // Fall through to the direct property for older host shapes.
+    return null
   }
-  return ctx?.deepseekAccount ?? null
 }
 
 function clientMetadata(ctx, version) {
@@ -105,13 +103,15 @@ export async function readQuotaAdvisory(ctx, { signal, timeoutMs = DEFAULT_TIMEO
     timer = setTimeout(() => resolve(TIMEOUT), Math.max(1, timeoutMs))
     timer.unref?.()
   })
+  let onAbort
   const aborted = signal
     ? new Promise(resolve => {
       if (signal.aborted) {
         resolve(ABORTED)
         return
       }
-      signal.addEventListener('abort', () => resolve(ABORTED), { once: true })
+      onAbort = () => resolve(ABORTED)
+      signal.addEventListener('abort', onAbort, { once: true })
     })
     : undefined
 
@@ -152,5 +152,6 @@ export async function readQuotaAdvisory(ctx, { signal, timeoutMs = DEFAULT_TIMEO
     }
   } finally {
     clearTimeout(timer)
+    if (onAbort) signal.removeEventListener('abort', onAbort)
   }
 }

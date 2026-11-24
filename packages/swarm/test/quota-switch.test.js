@@ -163,29 +163,9 @@ function makeRuntime({ rootSession, llm, account } = {}) {
   const state = new BoardState({ ctx, store, board: boardApi, channels: {}, logger: null });
   const host = new SwarmHost({ ctx, store, state, channels: {}, logger: null, makeMessage });
 
-  // board.js on this branch predates the lead's consumeFallback/confirmedSwitch
-  // additions; emulate those coordinator-only transitions so the host half can
-  // be exercised end-to-end without editing the core.
   const originalAct = state.act.bind(state);
-  state.act = async (rootId, actorId, action) => {
+  state.act = (rootId, actorId, action) => {
     actions.push(action);
-    const board = state.board(rootId);
-    const member = action.target ? board?.members?.[action.target] : null;
-    if (action.type === 'consumeFallback') {
-      if (!member) return { result: { ok: false, code: 'NOT_FOUND' } };
-      if (!member.fallbackRoute) return { result: { ok: false, code: 'NO_FALLBACK' } };
-      if (action.expect && !sameModelRoute(action.expect, member.modelRoute)) {
-        return { result: { ok: false, code: 'STALE_ROUTE' } };
-      }
-      const route = { ...member.fallbackRoute };
-      member.fallbackRoute = null;
-      return { result: { ok: true, route } };
-    }
-    if (action.type === 'setModel' && action.confirmedSwitch) {
-      if (!member) return { result: { ok: false, code: 'NOT_FOUND' } };
-      member.modelRoute = { ...action.modelRoute };
-      return { result: { ok: true, member } };
-    }
     return originalAct(rootId, actorId, action);
   };
 
@@ -200,12 +180,13 @@ async function setup(options = {}) {
     name: 'alice',
     prompt: 'do the task',
     role: 'worker',
+    modelRoute: options.primary,
+    fallbackRoute: options.fallback === null ? null : options.fallback ?? BACKUP,
     signal: new AbortController().signal,
   });
   const board = rt.state.board('root');
   const member = board.members[added.sessionId];
-  member.modelRoute = { ...(options.primary ?? CHAT) };
-  member.fallbackRoute = options.fallback === null ? null : { ...(options.fallback ?? BACKUP) };
+  if (member.fallbackRoute) assert.deepEqual(rt.spawns[0].agentOptions, member.modelRoute);
   const agent = rt.agents.get(added.sessionId);
   const idle = deferred();
   const selections = [];
@@ -217,7 +198,7 @@ async function setup(options = {}) {
     },
   };
   agent.whenIdle = options.whenIdle ?? (() => idle.promise);
-  return { ...rt, member, agent, idle, selections, sessionId: added.sessionId };
+  return { ...rt, get member() { return rt.state.member('root', added.sessionId); }, agent, idle, selections, sessionId: added.sessionId };
 }
 
 function quotaFailure(code = 'ACCOUNT_QUOTA') {
@@ -441,7 +422,9 @@ test('quota exhaustion without a fallback pauses immediately and keeps the sessi
 });
 
 test('an unauthorized fallback is never consumed and the member pauses safely', async (t) => {
-  const rt = await setup({ rootSession: sessionWithPolicy({ policy: [CHAT] }) });
+  const policy = [CHAT, BACKUP];
+  const rt = await setup({ rootSession: sessionWithPolicy({ policy }) });
+  policy.pop(); // no longer authorized by the time the primary is exhausted
   t.after(() => rt.host.close());
   const result = await rt.host.requestError(
     { agent: rt.agent, failure: quotaFailure() },
@@ -504,6 +487,19 @@ test('a member that never becomes idle is paused at the continuation deadline', 
   await waitFor(() => rt.state.member('root', rt.sessionId).status === 'paused', 'idle deadline pause', 400, 5);
   assert.equal(rt.host.switching.size, 0);
   assert.match(rt.root.steers.at(-1).content[0].text, /did not become idle/);
+});
+
+test('late idle after timeout and manual resume does not send a stale continuation', async t => {
+  const rt = await setup({ rootSession: sessionWithPolicy({ policy: [CHAT, BACKUP] }) });
+  t.after(() => rt.host.close());
+  rt.host.switchContinuationTimeoutMs = 10;
+  await rt.host.requestError({ agent: rt.agent, failure: quotaFailure() }, async () => ({ kind: 'retry' }));
+  await waitFor(() => rt.member.status === 'paused', 'deadline pause', 100, 5);
+  await rt.host.resumeMember('root', 'alice');
+  const sent = rt.sends.length;
+  rt.idle.resolve();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(rt.sends.length, sent, 'the operator already resumed this worker');
 });
 
 test('the coordinator sendMember wrapper is preferred for continuation', async (t) => {

@@ -367,7 +367,10 @@ export class SwarmHost {
           out.result?.message ?? 'the fallback route could not be claimed',
         );
       }
-      const claimed = normalizeModelRoute(out.result.route ?? route, 'fallback route');
+      const claimed = normalizeModelRoute(out.result.route, 'fallback route');
+      if (!sameModelRoute(route, claimed)) throw failure('STALE_ROUTE', 'the claimed fallback does not match the validated route');
+      signal.throwIfAborted();
+      if (this.switching.get(memberId) !== record) return true;
       // Authorization is checked again immediately before the session route
       // changes; consuming a fallback is not itself proof of authorization.
       assertRouteAllowed(claimed, { rootAgent, label: 'fallback route' });
@@ -430,17 +433,22 @@ export class SwarmHost {
       return;
     }
     const record = this.switching.get(memberId);
-    if (record) {
-      record.timer = setTimeout(() => {
-        if (!this.switching.has(memberId)) return;
-        this.clearSwitch(memberId);
-        void this.pauseQuotaMember(entry, 'the member did not become idle after the model switch');
-      }, Math.max(1, this.switchContinuationTimeoutMs));
-      record.timer.unref?.();
-    }
+    if (!record) return;
+    const current = () => this.switching.get(memberId) === record;
+    record.timer = setTimeout(() => {
+      if (!current()) return;
+      this.clearSwitch(memberId);
+      void this.pauseQuotaMember(entry, 'the member did not become idle after the model switch');
+    }, Math.max(1, this.switchContinuationTimeoutMs));
+    record.timer.unref?.();
     void Promise.resolve(agent.whenIdle())
-      .then(() => this.continueAfterSwitch(entry, route))
+      .then(() => {
+        if (!current()) return; // timeout, operator action or shutdown superseded this wake
+        this.clearSwitch(memberId); // the old turn ended; guard errors on the new route normally
+        return this.continueAfterSwitch(entry, route);
+      })
       .catch(() => {
+        if (!current()) return;
         this.clearSwitch(memberId);
         return this.pauseQuotaMember(entry, 'waiting for the member turn to finish failed');
       });
@@ -472,20 +480,7 @@ export class SwarmHost {
         `[Swarm] Your previous model route was exhausted (${modelRouteLabel(route)} is now active).`,
         'This is the same member session and the same task: continue from the interrupted step instead of restarting it.',
       ].join(' ');
-      if (typeof this.sendMember === 'function') {
-        await this.sendMember(rootAgent, memberId, [{ type: 'text', text }], {
-          signal: this.lifecycle.signal,
-        });
-      } else if (typeof this.ctx.subagents?.sendMessage === 'function') {
-        await this.ctx.subagents.sendMessage(rootAgent, memberId, [{ type: 'text', text }], {
-          signal: this.lifecycle.signal,
-        });
-      } else {
-        throw failure(
-          ROUTE_ERRORS.UNAVAILABLE,
-          'this host cannot send a continuation to a member session',
-        );
-      }
+      await this.sendMember(rootAgent, memberId, [{ type: 'text', text }], { signal: this.lifecycle.signal });
       this.quotaFailures.delete(memberId);
       await this.steerRoot(
         entry.rootId,
@@ -497,8 +492,6 @@ export class SwarmHost {
         entry,
         `the switched member could not continue: ${oneLine(asHostError(error).message, 200)}`,
       );
-    } finally {
-      this.clearSwitch(memberId);
     }
   }
 
@@ -999,6 +992,18 @@ export class SwarmHost {
     try {
       if (guard.cancelled) throw this.cancelledAdd(guard);
 
+      const controller = new AbortController();
+      guard.controller = controller;
+      onAbort = () => controller.abort(signal?.reason ?? new Error('swarm add aborted'));
+      if (guard.cancelled || signal?.aborted) onAbort();
+      else signal?.addEventListener?.('abort', onAbort, { once: true });
+      timer = setTimeout(() => controller.abort(new Error('swarm spawn timed out')), timeoutMs);
+      timer.unref?.();
+      if (modelRoute || fallbackRoute) {
+        ({ primary: modelRoute, fallback: fallbackRoute } = await this.validateDispatchRoutes(modelRoute, fallbackRoute, { rootAgent, signal: controller.signal }));
+        controller.signal.throwIfAborted();
+      }
+
       // Joining a channel is not creating it. Make the coordinator's intent
       // explicit and idempotent: channel names passed at spawn time are created
       // first, while an unknown channel still fails if creation itself fails.
@@ -1027,18 +1032,7 @@ export class SwarmHost {
         throw this.cancelledAdd(guard);
       }
 
-      const controller = new AbortController();
-      guard.controller = controller;
-      onAbort = () => controller.abort(signal?.reason ?? new Error('swarm add aborted'));
-      if (guard.cancelled || signal?.aborted) onAbort();
-      else signal?.addEventListener?.('abort', onAbort, { once: true });
-      timer = setTimeout(() => controller.abort(new Error('swarm spawn timed out')), timeoutMs);
-      timer.unref?.();
-
       try {
-        if (modelRoute || fallbackRoute) {
-          await this.validateDispatchRoutes(modelRoute, fallbackRoute, { rootAgent, signal: controller.signal });
-        }
         if (workspaceMode === 'branch') {
           checkout = await (await this.gitWorktrees()).prepare({ rootAgent, memberName: cleanName, memberSessionId: sessionId, signal: controller.signal });
         }
@@ -1219,6 +1213,7 @@ export class SwarmHost {
     const out = await this.state.act(rootId, rootId, { type, target: member.sessionId });
     if (!out.result?.ok) throw new HostError(out.result?.code ?? 'MANAGE_FAILED', out.result?.message ?? `${type} failed`);
     if (type === 'kill' || type === 'pause') {
+      this.clearSwitch(member.sessionId);
       const handle = this.handles.get(member.sessionId);
       let disposeFailure = null;
       if (handle) {

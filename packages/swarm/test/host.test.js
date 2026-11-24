@@ -246,6 +246,7 @@ test('routes are checked as the root, passed to the native spawn, and visible af
   rt.host.validateDispatchRoutes = async (primary, fallback, { rootAgent, signal }) => {
     assert.equal(rootAgent, rt.root); assert.equal(signal.aborted, false);
     assert.deepEqual(primary, modelRoute); assert.deepEqual(fallback, fallbackRoute); checks++;
+    return { primary, fallback };
   };
   const { sessionId } = await rt.host.addMember({ rootAgent: rt.root, name: 'alice', prompt: 'work', modelRoute, fallbackRoute });
   assert.equal(checks, 1); assert.deepEqual(rt.spawns[0].agentOptions, modelRoute);
