@@ -6,7 +6,7 @@ import * as boardApi from '../src/board.js';
 import { BoardState, boardKey } from '../src/host-state.js';
 import { SwarmHost, createSwarmMessage } from '../src/host-runtime.js';
 import { registerSwarmTools, formatStatus } from '../src/host-tools.js';
-import { registerSwarmCommands } from '../src/host-commands.js';
+import { readAddArgs, registerSwarmCommands } from '../src/host-commands.js';
 
 const clone = (value) => (value === undefined ? undefined : structuredClone(value));
 
@@ -186,6 +186,17 @@ async function waitFor(predicate, label) {
   assert.fail(`timed out waiting for ${label}`);
 }
 
+// Swarm routing/isolation: the task after -- is never interpreted as a dispatch option.
+test('add parses isolated checkout and qualified routes without rewriting the task', () => {
+  const args = readAddArgs(['alice', '--worktree', '--model', 'first/namespace/model', '--fallback', 'second/model', '--', 'check', '--model', 'literally']);
+  assert.equal(args.name, 'alice');
+  assert.equal(args.workspaceMode, 'branch');
+  assert.deepEqual(args.modelRoute, { provider: 'first', model: 'namespace/model' });
+  assert.deepEqual(args.fallbackRoute, { provider: 'second', model: 'model' });
+  assert.equal(args.prompt, 'check --model literally');
+  assert.throws(() => readAddArgs(['alice', 'work', '--model']), /provider\/model/);
+});
+
 test('creates a board and spawns a native member with the shared cwd', async (t) => {
   const rt = await setup();
   t.after(() => rt.host.close());
@@ -205,6 +216,94 @@ test('creates a board and spawns a native member with the shared cwd', async (t)
   assert.equal(spec.agentPreset, undefined, 'inherits the parent preset, never widens it');
   assert.match(spec.prompt[0].text, /You are "alice"/);
   assert.match(spec.prompt[0].text, /do the task/);
+});
+
+test('isolated dispatch persists the delivery record, rejects live/non-root merges, and reconciles delivery once', async (t) => {
+  const rt = await setup();
+  t.after(() => rt.host.close());
+  let deliveries = 0;
+  rt.host.worktrees = {
+    prepare: async ({ memberSessionId, memberName, rootAgent }) => ({ version: 1, id: 'wt_1', rootSessionId: rootAgent.id, member: memberName, memberSessionId, status: 'prepared', path: '/repo/checkout', branch: 'swarm/alice' }),
+    merge: async ({ record, active }) => { assert.equal(active, false); deliveries++; return { status: 'merged', record: { ...record, status: 'merged', updatedAt: 42 } }; },
+  };
+  const { sessionId } = await rt.host.addMember({ rootAgent: rt.root, name: 'alice', prompt: 'write code', workspaceMode: 'branch' });
+  assert.equal(rt.spawns[0].cwd, '/repo/checkout');
+  assert.match(rt.spawns[0].prompt[0].text, /isolated Git checkout/);
+  assert.equal(rt.store.get(boardKey('root')).members[sessionId].worktree.branch, 'swarm/alice');
+  await assert.rejects(rt.host.mergeMember(rt.agents.get(sessionId), 'alice'), { code: 'FORBIDDEN' });
+  await assert.rejects(rt.host.mergeMember(rt.root, 'alice'), { code: 'MEMBER_ACTIVE' });
+  await rt.host.killMember('root', 'alice');
+  assert.equal((await rt.host.mergeMember(rt.root, 'alice')).status, 'merged');
+  assert.equal((await rt.host.mergeMember(rt.root, 'alice')).status, 'already-delivered');
+  assert.equal(deliveries, 1);
+});
+
+test('routes are checked as the root, passed to the native spawn, and visible after storage reload', async (t) => {
+  const rt = await setup();
+  t.after(() => rt.host.close());
+  const modelRoute = { provider: 'allowed', model: 'models/fast' }, fallbackRoute = { provider: 'allowed', model: 'models/backup' };
+  let checks = 0;
+  rt.host.validateDispatchRoutes = async (primary, fallback, { rootAgent, signal }) => {
+    assert.equal(rootAgent, rt.root); assert.equal(signal.aborted, false);
+    assert.deepEqual(primary, modelRoute); assert.deepEqual(fallback, fallbackRoute); checks++;
+  };
+  const { sessionId } = await rt.host.addMember({ rootAgent: rt.root, name: 'alice', prompt: 'work', modelRoute, fallbackRoute });
+  assert.equal(checks, 1); assert.deepEqual(rt.spawns[0].agentOptions, modelRoute);
+  assert.deepEqual(rt.store.get(boardKey('root')).members[sessionId].fallbackRoute, fallbackRoute);
+  assert.match(formatStatus(rt.host.view('root')), /fallback: allowed\/models\/backup/);
+});
+
+test('failed isolated spawn rolls back only confirmed inactive checkouts; unsafe cleanup reports recovery metadata', async (t) => {
+  const rt = await setup({ spawnError: new Error('failed spawn') });
+  t.after(() => rt.host.close());
+  let unsafe = false, attempts = 0;
+  rt.host.worktrees = {
+    prepare: async () => ({ id: 'wt_1', path: '/repo/work', branch: 'swarm/recover' }),
+    rollback: async ({ active }) => { assert.equal(active, false); attempts++; if (unsafe) throw new Error('checkout dirty'); return {}; },
+  };
+  const dispatch = () => rt.host.addMember({ rootAgent: rt.root, name: 'alice', prompt: 'code', workspaceMode: 'branch' });
+  await assert.rejects(dispatch, /failed spawn/);
+  unsafe = true; await assert.rejects(dispatch, e => e.code === 'CHECKOUT_PRESERVED' && /swarm\/recover/.test(e.message));
+  assert.equal(attempts, 2);
+  assert.deepEqual(Object.keys(rt.store.get(boardKey('root')).reservations), []);
+});
+
+test('wallet monitoring is root opt-in, deduplicated per crossing, and ignores unknown or bonus balances', async (t) => {
+  const rt = await setup();
+  t.after(() => rt.host.close());
+  const { sessionId } = await addAlice(rt);
+  registerSwarmCommands(rt.host);
+  const command = (rawInput, agent = rt.root) => rt.commands[0].handler({ agent, rawInput });
+  let amount = '2.50', reads = 0;
+  rt.host.quotaAdvisory = async () => { reads++; return { supported: true, signedIn: true, balances: [{ currency: 'CNY', amount, wallet: 'recharge' }, { currency: 'CNY', amount: '100', wallet: 'bonus' }] }; };
+  const alerts = [];
+  rt.host.steerRoot = async (_root, message) => alerts.push(message);
+  await rt.host.walletAlerts.poll();
+  assert.equal((await command('swarm quota', rt.agents.get(sessionId))).kind, 'error');
+  assert.equal((await command('swarm quota watch CNY -1')).kind, 'error');
+  assert.equal(reads, 0);
+  assert.equal((await command('swarm quota watch CNY 5')).kind, 'success');
+  await rt.host.walletAlerts.poll(); await rt.host.walletAlerts.poll();
+  assert.equal(alerts.length, 1);
+  amount = '8'; await rt.host.walletAlerts.poll();
+  amount = null; await rt.host.walletAlerts.poll();
+  assert.equal(alerts.length, 1);
+  amount = '1'; await rt.host.walletAlerts.poll();
+  assert.equal(alerts.length, 2);
+  await command('swarm quota off');
+  const before = reads; await rt.host.walletAlerts.poll(); assert.equal(reads, before);
+});
+
+test('requested capabilities fail closed on old hosts, without spawning or reserving', async (t) => {
+  const rt = await setup();
+  t.after(() => rt.host.close());
+  for (const options of [{ workspaceMode: 'branch' }, { workspaceMode: 'external' }, { modelRoute: { provider: 'p', model: 'm' } }, { fallbackRoute: { provider: 'q', model: 'n' } }]) {
+    await assert.rejects(rt.host.addMember({ rootAgent: rt.root, name: 'alice', prompt: 'do not downgrade', ...options }));
+    assert.deepEqual(Object.keys(rt.state.board('root').reservations), []);
+    assert.equal(Object.keys(rt.state.board('root').members).length, 1);
+  }
+  assert.equal(rt.spawns.length, 0);
+  assert.equal((await addAlice(rt)).member.name, 'alice', 'default shared/inherited dispatch still works');
 });
 
 test('spawn failure is compensated with failJoin and leaves no member', async (t) => {

@@ -1,4 +1,5 @@
 import { asHostError, failure, oneLine, parseSwarmInput, splitWords, truncateText } from './host-format.js';
+import { parseAlert } from './quota-watch.js';
 import { formatStatus } from './host-tools.js';
 
 const USAGE = [
@@ -7,7 +8,10 @@ const USAGE = [
   '/swarm init [title]                 Create the board for this root session',
   '/swarm add <name> [flags] <task>    Spawn a teammate (alias: start)',
   '  flags: --role worker|monitor  --channel <name>  --wake mentions|anything',
+  '         --worktree  --model <provider/model>  --fallback <provider/model>  -- <literal task>',
+  '/swarm merge <name>                 Fast-forward the lead checkout from a finished member',
   '/swarm status                       Board, member and plan summary',
+  '/swarm quota [watch <CNY|USD> <amount> | off]   First-party DeepSeek wallet and optional low-balance alert (root)',
   '/swarm goal <text>                  Set/replace the plan goal',
   '/swarm post <text>                  Post as yourself',
   '/swarm pause|resume|kill <name>     Manage a teammate',
@@ -29,12 +33,26 @@ function readAddArgs(words) {
     tail = copy.splice(dart + 1);
     copy.splice(dart, 1);
   }
+  const modelRoute = takeRoute(copy, '--model');
+  const fallbackRoute = takeRoute(copy, '--fallback');
+  const branchIndex = copy.indexOf('--worktree');
+  if (branchIndex !== -1) copy.splice(branchIndex, 1);
   const role = take(copy, '--role');
   const channel = take(copy, '--channel');
   const wakeMode = take(copy, '--wake');
   const name = copy.shift();
   const rest = [...copy, ...tail].join(' ').trim();
-  return { name, prompt: rest, role, channel, wakeMode };
+  return { name, prompt: rest, role, channel, wakeMode, modelRoute, fallbackRoute, workspaceMode: branchIndex === -1 ? undefined : 'branch' };
+}
+
+function takeRoute(words, flag) {
+  if (!words.includes(flag)) return undefined;
+  const token = take(words, flag);
+  const match = /^([^/\s]+)\/(\S+)$/.exec(token ?? '');
+  if (!match || token.startsWith('--') || words.includes(flag)) {
+    throw failure('INVALID_ARGUMENT', `${flag} requires one provider/model`);
+  }
+  return { provider: match[1], model: match[2] };
 }
 
 function take(words, flag) {
@@ -47,7 +65,8 @@ function take(words, flag) {
 
 function commandError(prefix, error) {
   const hostError = asHostError(error);
-  return { kind: 'error', text: `${prefix}: ${hostError.message}` };
+  const detail = hostError.details?.manual || hostError.details?.worktree ? ` ${truncateText(JSON.stringify(hostError.details), 2200)}` : '';
+  return { kind: 'error', text: `${prefix}: ${hostError.message}${detail}` };
 }
 
 function parseCommand(rawInput) {
@@ -106,7 +125,7 @@ export function registerSwarmCommands(host) {
           case 'add':
           case 'start': {
             if (!entry.isRoot) throw failure('FORBIDDEN', 'only the swarm root can add teammates');
-            const { name, prompt, role, channel, wakeMode } = readAddArgs(words);
+            const { name, prompt, role, channel, ...options } = readAddArgs(words);
             if (!name) throw failure('INVALID_ARGUMENT', 'usage: /swarm add <name> [flags] <task>');
             if (!prompt) throw failure('INVALID_ARGUMENT', 'a task prompt is required');
             if (role !== undefined && !['worker', 'monitor'].includes(role)) {
@@ -118,13 +137,40 @@ export function registerSwarmCommands(host) {
               prompt,
               role: role ?? 'worker',
               channels: channel ? [channel] : undefined,
-              wakeMode,
+              ...options,
               signal,
             });
             return {
               kind: 'success',
-              text: `Added ${added.member.name} (${added.member.role}). It shares the lead working directory and starts with your task.`,
+              text: `Added ${added.member.name} (${added.member.role}). Workspace: ${added.member.worktreePath ?? 'shared with the lead'}.`,
             };
+          }
+          case 'quota': {
+            if (!entry.isRoot) throw failure('FORBIDDEN', 'only the root can read or monitor its account balance');
+            if (!words.length) {
+              const advisory = await host.quotaAdvisory({ signal });
+              return { kind: 'success', text: JSON.stringify({ watch: entry.board.quotaWatch ?? null, ...advisory }) };
+            }
+            let watch;
+            if (words[0] === 'off' && words.length === 1) watch = null;
+            else if (words[0] === 'watch' && words.length === 3) watch = parseAlert(words[1], words[2]);
+            else throw failure('INVALID_ARGUMENT', 'usage: /swarm quota [watch CNY|USD <amount> | off]');
+            if (watch) {
+              const report = await host.quotaAdvisory({ signal });
+              if (!report?.supported || !report.signedIn || !report.balances?.some(x => x.currency === watch.currency && x.wallet === 'recharge')) {
+                throw failure('BALANCE_UNAVAILABLE', report?.reason ?? `no ${watch.currency} recharge wallet reported`);
+              }
+            }
+            const out = await host.state.act(entry.rootId, agent.id, { type: 'setQuotaWatch', watch });
+            if (!out.result?.ok) throw failure(out.result.code, out.result.message);
+            host.walletAlerts.alerted.delete(entry.rootId);
+            return { kind: 'success', text: watch ? `Alert enabled for DeepSeek recharge wallet at or below ${watch.threshold} ${watch.currency}.` : 'Balance alerts off.' };
+          }
+          case 'merge': {
+            if (!entry.isRoot) throw failure('FORBIDDEN', 'only the swarm root can merge a teammate');
+            if (words.length !== 1) throw failure('INVALID_ARGUMENT', 'usage: /swarm merge <name>');
+            const delivery = await host.mergeMember(agent, words[0], signal);
+            return { kind: 'success', text: `Delivered ${words[0]}: ${JSON.stringify(delivery)}. Checkout and branch retained.` };
           }
           case 'goal': {
             if (!entry.isRoot) throw failure('FORBIDDEN', 'only the swarm root can set the goal');

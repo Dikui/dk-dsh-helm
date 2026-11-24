@@ -175,6 +175,22 @@ test('newBoard seeds an empty board with a coordinator and main channel', () => 
   assert.equal(board.plan.goal.title, '');
 });
 
+test('only the coordinator can claim one reserved fallback; working members need not be restarted', () => {
+  const route = { provider: 'secondary', model: 'fast' };
+  const { state } = addWorker(seedBoard(), WORKER, 'alice', { fallbackRoute: route });
+  const working = transition(state, WORKER, { type: 'setStatus', status: 'working' }).state;
+  const claim = { type: 'consumeFallback', target: WORKER };
+  assertFailure(transition(working, WORKER, claim), ERRORS.FORBIDDEN);
+  const consumed = transition(working, COORD, claim);
+  assert.equal(consumed.result.ok, true);
+  assert.deepEqual(consumed.result.route, route);
+  assert.equal(consumed.state.members[WORKER].modelRoute, null, 'a claim is not evidence of a model switch');
+  assert.equal(consumed.state.members[WORKER].fallbackRoute, null);
+  assert.equal(transition(consumed.state, COORD, claim).result.ok, false);
+  const paused = transition(working, COORD, { type: 'pause', target: WORKER }).state;
+  assertFailure(transition(paused, COORD, claim), ERRORS.PAUSED);
+});
+
 test('a board with no coordinator can be bootstrapped once', () => {
   const empty = newBoard(ROOT, 'Swarm', { now: T0 });
   assertFailure(transition(empty, 'stranger', { type: 'read' }), ERRORS.NOT_MEMBER);

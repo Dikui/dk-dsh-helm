@@ -239,6 +239,7 @@ function memberView(board, member) {
     joinedAtSeq: member.joinedAtSeq,
     updatedAtSeq: member.updatedAtSeq,
     modelRoute: member.modelRoute ? { ...member.modelRoute } : null,
+    fallbackRoute: member.fallbackRoute ? { ...member.fallbackRoute } : null,
     workspaceMode: member.workspaceMode,
     worktreeId: member.worktreeId,
     worktreePath: member.worktreePath,
@@ -430,6 +431,7 @@ function createMember(draft, spec, addedBy, now) {
     joinedAtSeq: draft.seq,
     updatedAtSeq: now,
     modelRoute: spec.modelRoute ?? null,
+    fallbackRoute: spec.fallbackRoute ?? null,
     workspaceMode: spec.workspaceMode ?? 'inherit',
     worktreeId: spec.worktreeId ?? null,
     worktreePath: spec.worktreePath ?? null,
@@ -485,6 +487,8 @@ function readSpec(actor, draft, raw, { reserve = false } = {}) {
   }
   const model = normalizeModelRoute(raw.modelRoute);
   if (model.error) return { error: model.error };
+  const fallback = normalizeModelRoute(raw.fallbackRoute);
+  if (fallback.error) return { error: fallback.error };
   const workspace = normalizeWorkspace(raw);
   if (workspace.error) return { error: workspace.error };
   const lastReadSeq =
@@ -500,6 +504,7 @@ function readSpec(actor, draft, raw, { reserve = false } = {}) {
       wakeMode,
       channels: channelResult.channels,
       modelRoute: model.route,
+      fallbackRoute: fallback.route,
       ...workspace.value,
       lastReadSeq,
       reserved: reserve,
@@ -637,6 +642,12 @@ function commitJoin(draft, actor, action, now) {
   }
   const channelResult = normalizeChannels(reservation.channels, draft);
   if (channelResult.error) return channelResult.error;
+  const checkout = action.worktree;
+  if (checkout != null && (actor.role !== 'coordinator' || reservation.workspaceMode !== 'branch' ||
+      checkout.rootSessionId !== draft.rootId || checkout.memberSessionId !== reservation.sessionId ||
+      checkout.member !== reservation.name || !checkout.id || !checkout.path || checkout.status !== 'prepared')) {
+    return fail(ERRORS.FORBIDDEN, 'only the coordinator may attach the reserved checkout');
+  }
   delete draft.reservations[id];
   const member = createMember(
     draft,
@@ -644,6 +655,11 @@ function commitJoin(draft, actor, action, now) {
     reservation.reservedBy,
     now,
   );
+  if (checkout != null) {
+    member.worktree = { ...checkout };
+    member.worktreeId = checkout.id;
+    member.worktreePath = checkout.path;
+  }
   return ok({ member: memberView(draft, member) });
 }
 
@@ -775,12 +791,14 @@ function setModel(draft, actor, action, now) {
   if (!target) return fail(ERRORS.NOT_FOUND, 'target member not found');
   if (!canManage(actor, target)) return fail(ERRORS.FORBIDDEN, 'cannot manage this member');
   if (target.status === 'killed') return fail(ERRORS.CLOSED, 'member is killed');
-  if (target.status === 'working') return fail(ERRORS.BUSY, 'member is working');
+  if (action.confirmedSwitch && actor.role !== 'coordinator') return fail(ERRORS.FORBIDDEN, 'coordinator only');
+  if (target.status === 'working' && !action.confirmedSwitch) return fail(ERRORS.BUSY, 'member is working');
   const model = normalizeModelRoute(action.modelRoute ?? action.model);
   if (model.error) return model.error;
   if (!model.route) return fail(ERRORS.INVALID_ARGUMENT, 'modelRoute is required');
   target.modelRoute = model.route;
   target.updatedAtSeq = now;
+  if (action.confirmedSwitch) return ok({ member: memberView(draft, target) });
   const wakes = [];
   if (target.status === 'waiting' || target.status === 'stopped') {
     if (makePending(draft, target, draft.seq, 'model', now, true)) {
@@ -788,6 +806,24 @@ function setModel(draft, actor, action, now) {
     }
   }
   return ok({ member: memberView(draft, target) }, wakes);
+}
+
+// A fallback is a one-shot grant, not a new agent or a generic model override.
+// Claim it durably before touching a live session: a crash must not loop back.
+function consumeFallback(draft, actor, action, now) {
+  if (actor.role !== 'coordinator') return fail(ERRORS.FORBIDDEN, 'coordinator only');
+  const member = memberBySession(draft, action.target);
+  if (!member || member.role === 'coordinator') return fail(ERRORS.NOT_FOUND, 'worker not found');
+  if (member.status === 'paused') return fail(ERRORS.PAUSED, 'member is paused');
+  if (member.status === 'killed') return fail(ERRORS.CLOSED, 'member is killed');
+  if (!member.fallbackRoute) return fail('NO_FALLBACK', 'no fallback available');
+  if (action.expect && (member.modelRoute?.provider !== action.expect.provider || member.modelRoute?.model !== action.expect.model)) {
+    return fail('STALE_ROUTE', 'model route changed');
+  }
+  const route = member.fallbackRoute;
+  member.fallbackRoute = null;
+  member.updatedAtSeq = now;
+  return ok({ route, member: memberView(draft, member) });
 }
 
 function killMember(draft, actor, action, now) {
@@ -1692,6 +1728,30 @@ export function transition(board, actorSessionId, action) {
       const denied = requireActor();
       if (denied) outcome = denied;
       else outcome = setModel(draft, actor, action, now);
+      break;
+    }
+    case 'setQuotaWatch': {
+      if (actor?.role !== 'coordinator') outcome = fail(ERRORS.FORBIDDEN, 'coordinator only');
+      else if (action.watch !== null && (!['CNY', 'USD'].includes(action.watch?.currency) || !Number.isFinite(action.watch?.threshold) || action.watch.threshold <= 0)) outcome = fail(ERRORS.INVALID_ARGUMENT, 'invalid balance threshold');
+      else {
+        draft.quotaWatch = action.watch ? { currency: action.watch.currency, threshold: action.watch.threshold } : null;
+        outcome = ok({ watch: draft.quotaWatch });
+      }
+      break;
+    }
+    case 'recordMerge': {
+      const target = memberBySession(draft, action.target);
+      if (actor?.role !== 'coordinator') outcome = fail(ERRORS.FORBIDDEN, 'coordinator only');
+      else if (target?.status !== 'killed' || !target.worktree || target.worktree.id !== action.worktreeId) outcome = fail(ERRORS.INVALID_ARGUMENT, 'checkout mismatch');
+      else {
+        target.worktree = { ...target.worktree, status: 'merged', updatedAt: action.updatedAt };
+        outcome = ok({ member: memberView(draft, target) });
+      }
+      break;
+    }
+    case 'consumeFallback': {
+      const denied = requireActor();
+      outcome = denied ?? consumeFallback(draft, actor, action, now);
       break;
     }
     case 'kill': {

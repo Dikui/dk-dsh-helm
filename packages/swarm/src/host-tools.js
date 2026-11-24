@@ -69,10 +69,15 @@ function validatePublicPlan(plan) {
   return plan;
 }
 
+const routeSchema = (description) => ({
+  ...schema({ provider: { type: 'string', minLength: 1, maxLength: 120 }, model: { type: 'string', minLength: 1, maxLength: 200 } }, ['provider', 'model']), description,
+});
+
 function memberLine(member) {
   const role = member.role === 'coordinator' ? 'lead' : member.role;
   const unread = member.unread ? `, ${member.unread} unread` : '';
-  return `- ${member.name} (${role}, ${member.status}${unread})`;
+  const options = [member.workspaceMode === 'branch' && 'Git worktree', member.model, member.fallback && `fallback: ${member.fallback}`].filter(Boolean);
+  return `- ${member.name} (${[role, `${member.status}${unread}`, ...options].join(', ')})`;
 }
 
 export function formatStatus(view) {
@@ -94,7 +99,7 @@ export function registerSwarmTools(host) {
     {
       name: 'swarm',
       description:
-        'Swarm coordinator control. Only the root/lead session may use it. Actions: status, add (native teammate), kill, pause, resume, title, goal, post, reconcile, channel-create, channel-list, channel-archive, channel-subscribe, channel-unsubscribe. Members use post_message/read_board/swarm_wait instead.',
+        'Swarm coordinator control. Only the root/lead session may use it. Actions: status, add (native teammate; optional routed model and isolated checkout), merge (explicit delivery), kill, pause, resume, title, goal, post, reconcile, channel-create, channel-list, channel-archive, channel-subscribe, channel-unsubscribe. Members use post_message/read_board/swarm_wait instead.',
       parameters: schema(
         {
           action: {
@@ -102,6 +107,7 @@ export function registerSwarmTools(host) {
             enum: [
               'status',
               'add',
+              'merge',
               'kill',
               'pause',
               'resume',
@@ -120,6 +126,9 @@ export function registerSwarmTools(host) {
           },
           name: { type: 'string', description: 'Member name for add; target name for kill/pause/resume.' },
           prompt: { type: 'string', description: 'Full initial task for a new member.' },
+          workspaceMode: { type: 'string', enum: ['share', 'branch'], description: 'For add: shared cwd (default) or an isolated Git worktree from committed HEAD.' },
+          modelRoute: routeSchema('For add: authorized provider and model. Default inherits.'),
+          fallbackRoute: routeSchema('For add: one authorized alternative to continue the same member after quota errors.'),
           role: { type: 'string', enum: ['worker', 'monitor'], description: 'Member role (default worker).' },
           channels: { type: 'array', items: { type: 'string' }, description: 'Channels the member joins; missing channels are created first (default main).' },
           member: { type: 'string', description: 'Target member name (alias for name on management actions).' },
@@ -155,13 +164,20 @@ export function registerSwarmTools(host) {
                 prompt: args.prompt,
                 role: args.role ?? 'worker',
                 channels: args.channels,
+                modelRoute: args.modelRoute,
+                fallbackRoute: args.fallbackRoute,
+                workspaceMode: args.workspaceMode,
                 signal: exec.signal,
               });
               return {
                 ok: true,
                 member: member.member,
-                message: `Added ${member.member.name}. It starts in the shared workspace and will read the board.`,
+                message: `Added ${member.member.name}. Workspace: ${member.member.worktreePath ?? 'shared with the lead'}.`,
               };
+            }
+            case 'merge': {
+              const delivery = await host.mergeMember(exec.agent, args.member ?? args.name, exec.signal);
+              return { ok: true, delivery };
             }
             case 'kill':
             case 'pause':

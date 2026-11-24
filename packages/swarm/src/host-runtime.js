@@ -8,6 +8,7 @@ import {
   truncateText,
 } from './host-format.js';
 import { buildPublicView } from './host-view.js';
+import { WalletAlerts } from './quota-watch.js';
 import { startStallMonitor } from './stall-monitor.js';
 
 const SPAWN_TIMEOUT_MS = 120_000;
@@ -41,6 +42,7 @@ export class SwarmHost {
     this.store = store;
     this.state = state;
     this.channels = channels;
+    this.worktrees = null; // optional: shared dispatch does not require Git or a sandbox backend
     this.logger = logger;
     this.makeMessage = makeMessage ?? defaultMakeMessage;
     this.lifecycle = new AbortController();
@@ -58,12 +60,14 @@ export class SwarmHost {
     this.pendingReadLimit = 512;
     this.remindedSeq = new Map();
     this.recentWakes = new Map();
+    this.sendsInFlight = new Map();
     this.quotaFailures = new Map();
     this.activated = new Set();
     this.off = [];
     this.interval = null;
     this.disposed = false;
     this.startupReconciled = false;
+    this.walletAlerts = new WalletAlerts(this);
   }
 
   log(level, message, error) {
@@ -82,6 +86,7 @@ export class SwarmHost {
     await this.state.load();
     this.installEvents();
     this.interval = setInterval(() => {
+      this.walletAlerts.poll().catch(error => this.log('warn', 'balance alert check failed', error));
       this.cleanupReservations().catch((error) => this.log('warn', 'reservation cleanup failed', error));
     }, GUARD_INTERVAL_MS);
     this.interval.unref?.();
@@ -561,7 +566,34 @@ export class SwarmHost {
     return cwd;
   }
 
-  async addMember({ rootAgent, name, prompt, role = 'worker', channels, wakeMode, signal, timeoutMs = SPAWN_TIMEOUT_MS }) {
+  async gitWorktrees() {
+    if (!this.worktrees) {
+      const { createSwarmWorktrees } = await import('./worktree.js');
+      this.worktrees = createSwarmWorktrees({ ctx: this.ctx, logger: this.logger });
+    }
+    return this.worktrees;
+  }
+
+  async mergeMember(rootAgent, name, signal) {
+    const { rootId } = this.ensureRoot(rootAgent);
+    const member = this.state.memberByName(rootId, String(name ?? ''));
+    if (!member?.worktree) throw failure('NO_CHECKOUT', 'member has no Swarm-managed checkout');
+    // Killed is terminal: a parked or paused member could still wake during delivery.
+    const id = member.sessionId;
+    if (member.status !== 'killed' || this.handles.has(id) || this.sendsInFlight.has(id) || this.unconfirmedDisposals.get(rootId)?.has(id) || this.ctx.agents.get(id)) {
+      throw failure('MEMBER_ACTIVE', 'kill the member and wait for its activation to disappear before merging');
+    }
+    if (member.worktree.status === 'merged') return { status: 'already-delivered', branch: member.worktree.branch };
+    const delivery = await (await this.gitWorktrees()).merge({ rootAgent, record: member.worktree, active: false, signal });
+    const out = await this.state.act(rootId, rootId, { type: 'recordMerge', target: id, worktreeId: member.worktree.id, updatedAt: delivery.record.updatedAt });
+    if (!out.result?.ok) throw failure('DELIVERY_RECORD_FAILED', 'Git succeeded but the board update failed; retry merge to reconcile');
+    return delivery;
+  }
+
+  async addMember({
+    rootAgent, name, prompt, role = 'worker', channels, wakeMode, modelRoute, fallbackRoute,
+    workspaceMode = 'share', signal, timeoutMs = SPAWN_TIMEOUT_MS,
+  }) {
     const entry = this.ensureRoot(rootAgent);
     const rootId = entry.rootId;
     const cleanName = String(name ?? '').trim();
@@ -572,9 +604,13 @@ export class SwarmHost {
     if (!text) throw failure('INVALID_ARGUMENT', 'a task prompt is required');
     if (!['worker', 'monitor'].includes(role)) throw failure('INVALID_ARGUMENT', 'role must be worker or monitor');
 
+    if (!['share', 'branch'].includes(workspaceMode)) throw failure('INVALID_ARGUMENT', 'workspaceMode must be share or branch');
+    signal?.throwIfAborted?.();
     const sessionId = randomUUID();
     const guard = this.beginInflightAdd(rootId, sessionId);
     let activation = null;
+    let checkout = null;
+    let joined = false;
     let reservationId = null;
     let timer = null;
     let onAbort = null;
@@ -608,6 +644,7 @@ export class SwarmHost {
           role,
           ...(Array.isArray(channels) && channels.length ? { channels } : {}),
           ...(wakeMode ? { wakeMode } : {}),
+          workspaceMode, modelRoute, fallbackRoute,
         },
       });
       if (!reserved.result?.ok) {
@@ -628,14 +665,21 @@ export class SwarmHost {
       timer.unref?.();
 
       try {
-        const cwd = await this.sharedCwd(rootAgent, signal);
+        if (modelRoute || fallbackRoute) {
+          await this.validateDispatchRoutes(modelRoute, fallbackRoute, { rootAgent, signal: controller.signal });
+        }
+        if (workspaceMode === 'branch') {
+          checkout = await (await this.gitWorktrees()).prepare({ rootAgent, memberName: cleanName, memberSessionId: sessionId, signal: controller.signal });
+        }
+        const cwd = checkout?.path ?? await this.sharedCwd(rootAgent, controller.signal);
         if (guard.cancelled) throw this.cancelledAdd(guard);
+        controller.signal.throwIfAborted();
         const promptText = this.buildChildPrompt({
           name: cleanName,
           role,
           rootName: entry.self?.name ?? 'lead',
           prompt: text,
-          cwd,
+          cwd, workspaceMode,
         });
         activation = await this.ctx.subagents.startActivation({
           provider: 'spawn',
@@ -644,6 +688,7 @@ export class SwarmHost {
           prompt: [{ type: 'text', text: promptText }],
           signal: controller.signal,
           childId: sessionId,
+          ...(modelRoute ? { agentOptions: { provider: modelRoute.provider, model: modelRoute.model } } : {}),
           ...(cwd ? { cwd } : {}),
           ...(typeof this.ctx.subagents.resolveMaxDepth === 'function'
             ? { maxDepth: this.ctx.subagents.resolveMaxDepth() }
@@ -674,7 +719,7 @@ export class SwarmHost {
       // so a failed commit cannot surface as an unhandled rejection.
       let committed;
       try {
-        committed = await this.state.act(rootId, rootId, { type: 'commitJoin', reservationId });
+        committed = await this.state.act(rootId, rootId, { type: 'commitJoin', reservationId, worktree: checkout });
       } catch (error) {
         await disposeSpawn();
         await this.failJoin(
@@ -689,6 +734,7 @@ export class SwarmHost {
         await this.failJoin(rootId, reservationId, `commit failed: ${committed.result?.code ?? 'unknown'}`);
         throw new HostError(committed.result?.code ?? 'COMMIT_FAILED', committed.result?.message ?? 'commit failed');
       }
+      joined = true;
       if (guard.cancelled) {
         // finish accepted the add while its commit was landing. Tear the member
         // down here, before this call returns, so no worker can keep running.
@@ -708,16 +754,29 @@ export class SwarmHost {
         );
       }
       return { member: committed.result.member, sessionId, handle: activation };
+    } catch (error) {
+      if (checkout && !joined) {
+        try {
+          if (guard.disposeError || this.ctx.agents.get(sessionId) || this.unconfirmedDisposals.get(rootId)?.has(sessionId)) throw new Error('child disposal not confirmed');
+          const cleanup = await (await this.gitWorktrees()).rollback({ rootAgent, record: checkout, active: false, reason: 'join failed' });
+          if (cleanup.recovery) throw new Error('worker commits preserved');
+        } catch (cleanupError) {
+          throw failure('CHECKOUT_PRESERVED', `${error.message}; ${cleanupError.message}. Inspect ${checkout.branch} (${checkout.path}).`, { worktree: checkout });
+        }
+      }
+      throw error;
     } finally {
       clearSpawn();
       this.endInflightAdd(guard);
     }
   }
 
-  buildChildPrompt({ name, role, rootName, prompt, cwd }) {
+  buildChildPrompt({ name, role, rootName, prompt, cwd, workspaceMode }) {
     const lines = [
       `You are "${name}", a ${role} in the Swarm led by "${rootName}".`,
-      `Workspace: ${cwd ?? 'inherit the lead session working directory'} (shared with the lead; do not create worktrees unless the lead explicitly asks).`,
+      workspaceMode === 'branch'
+        ? `Workspace: ${cwd} (your isolated Git checkout). Make and test your changes here, commit the delivery, and post the commit for the lead to review. Never merge into the lead checkout yourself.`
+        : `Workspace: ${cwd ?? 'inherit the lead session working directory'} (shared with the lead; do not create worktrees unless the lead explicitly asks).`,
       '',
       'Your task:',
       truncateText(prompt, 10_000),
@@ -1035,6 +1094,17 @@ export class SwarmHost {
     return out.result;
   }
 
+  async sendMember(rootAgent, id, content, options) {
+    const member = this.state.member(rootAgent.id, id);
+    if (!member || ['paused', 'killed'].includes(member.status)) throw failure('MEMBER_INACTIVE', 'member is not eligible for wake');
+    this.sendsInFlight.set(id, (this.sendsInFlight.get(id) ?? 0) + 1);
+    try { return await this.ctx.subagents.sendMessage(rootAgent, id, content, options); }
+    finally {
+      const remaining = this.sendsInFlight.get(id) - 1;
+      if (remaining) this.sendsInFlight.set(id, remaining); else this.sendsInFlight.delete(id);
+    }
+  }
+
   async dispatchWakes(rootId, wakes) {
     if (this.disposed) return;
     const board = this.state.board(rootId);
@@ -1047,7 +1117,7 @@ export class SwarmHost {
       const key = `${wake.sessionId}:${wake.seq}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      const member = board.members?.[wake.sessionId];
+      const member = this.state.member(rootId, wake.sessionId);
       if (!member || member.status === 'killed' || member.status === 'paused') continue;
       if (wake.seq <= member.lastReadSeq) {
         const ack = await this.ack(rootId, wake.sessionId, wake.seq, true).catch(() => null);
@@ -1067,9 +1137,7 @@ export class SwarmHost {
           rootAgent.steer(message);
         } else {
           const text = this.wakeText({ board, member, wake });
-          await this.ctx.subagents.sendMessage(rootAgent, wake.sessionId, [{ type: 'text', text }], {
-            signal: this.lifecycle.signal,
-          });
+          await this.sendMember(rootAgent, wake.sessionId, [{ type: 'text', text }], { signal: this.lifecycle.signal });
         }
         const ack = await this.ack(rootId, wake.sessionId, wake.seq, true);
         if (ack?.ok) this.markReminded(wake.sessionId, wake.seq);
