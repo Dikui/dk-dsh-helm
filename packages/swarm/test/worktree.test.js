@@ -337,6 +337,36 @@ test('prepare failure preserves a dirty worktree instead of cleaning user work',
   )
 })
 
+test('prepare failure preserves ignored artifacts instead of deleting them during reap', async (t) => {
+  const { repo, agent } = setup(t)
+  commitFile(repo, '.gitignore', '.env\ncache/\n')
+  const baseHost = makeHost(repo)
+  const host = {
+    ...baseHost,
+    async run(agentArg, spec) {
+      if (spec.cwd !== repo && spec.cwd.includes(path.join('.agents', 'worktrees', 'swarm'))
+        && spec.args.includes('symbolic-ref')) {
+        fs.writeFileSync(path.join(spec.cwd, '.env'), 'SECRET=keep-me\n')
+        throw new WorktreeError('GIT_FAILED', 'scripted verification failure', {})
+      }
+      return baseHost.run(agentArg, spec)
+    },
+  }
+  const service = new SwarmWorktrees({ host })
+
+  await assert.rejects(
+    service.prepare({ rootAgent: agent, memberName: 'alpha' }),
+    (error) => {
+      assert.equal(error.details.reaped, false)
+      assert.equal(error.details.retained, true)
+      assert.equal(error.details.reapReason, 'ignored')
+      assert.equal(fs.readFileSync(path.join(error.details.path, '.env'), 'utf8'), 'SECRET=keep-me\n')
+      assert.equal(branchExists(repo, error.details.branch), true)
+      return true
+    },
+  )
+})
+
 test('merge fast-forwards the target branch and preserves the member worktree and branch', async (t) => {
   const { repo, agent, service } = setup(t)
   const record = await service.prepare({ rootAgent: agent, memberName: 'alpha' })
@@ -363,6 +393,43 @@ test('merge fast-forwards the target branch and preserves the member worktree an
   const again = await service.merge({ rootAgent: agent, record: result.record, active: false })
   assert.equal(again.status, 'already-merged')
   assert.equal(again.strategy, 'none')
+})
+
+test('merge delivers the verified memberHead even when the branch moves before the merge command', async (t) => {
+  const repo = makeRepo(t)
+  const agent = { session: { id: 'root-session', header: { cwd: repo } } }
+  const baseHost = makeHost(repo)
+  let record = null
+  let moved = false
+  const host = {
+    ...baseHost,
+    async run(agentArg, spec) {
+      if (!moved && spec.args.includes('merge') && spec.args.includes('--ff-only')) {
+        moved = true
+        commitFile(record.path, 'late.txt', 'late\n')
+      }
+      return baseHost.run(agentArg, spec)
+    },
+  }
+  const service = new SwarmWorktrees({ host })
+  record = await service.prepare({ rootAgent: agent, memberName: 'alpha' })
+  commitFile(record.path, 'feature.txt', 'delivered\n')
+  const verifiedHead = runGit(repo, ['rev-parse', `refs/heads/${record.branch}`]).stdout.trim()
+
+  const result = await service.merge({ rootAgent: agent, record, active: false })
+
+  assert.equal(result.status, 'merged')
+  assert.equal(result.strategy, 'ff-only')
+  assert.equal(result.memberHead, verifiedHead)
+  assert.equal(result.targetHead, verifiedHead)
+  assert.equal(result.branchMoved, true)
+  assert.notEqual(result.memberBranchHead, verifiedHead)
+  assert.equal(result.memberBranchHead, runGit(repo, ['rev-parse', `refs/heads/${record.branch}`]).stdout.trim())
+  // The verified commit was delivered; the later branch commit was not.
+  assert.equal(fs.readFileSync(path.join(repo, 'feature.txt'), 'utf8'), 'delivered\n')
+  assert.equal(fs.existsSync(path.join(repo, 'late.txt')), false)
+  assert.equal(fs.readFileSync(path.join(record.path, 'late.txt'), 'utf8'), 'late\n')
+  assert.equal(status(repo), '')
 })
 
 test('merge refuses active or non-root callers without touching the repository', async (t) => {
@@ -544,6 +611,34 @@ test('rollback removes a clean base-only worktree and its branch without force',
   assert.equal(branchExists(repo, record.branch), false)
   assert.equal(status(repo), '')
   assert.equal(runGit(repo, ['worktree', 'list', '--porcelain']).stdout.trim().split('\n\n').length, 1)
+})
+
+test('rollback refuses to delete ignored artifacts that git status calls clean', async (t) => {
+  const { repo, agent, service } = setup(t)
+  commitFile(repo, '.gitignore', '.env\ncache/\n')
+  const record = await service.prepare({ rootAgent: agent, memberName: 'alpha' })
+  fs.writeFileSync(path.join(record.path, '.env'), 'SECRET=keep-me\n')
+  fs.mkdirSync(path.join(record.path, 'cache'))
+  fs.writeFileSync(path.join(record.path, 'cache', 'build.bin'), 'cache\n')
+  // git status ignores these, but `git worktree remove` would delete them.
+  assert.equal(status(record.path), '')
+
+  await assert.rejects(
+    service.rollback({ rootAgent: agent, record, active: false }),
+    (error) => {
+      assert.equal(error.code, 'WORKTREE_HAS_IGNORED')
+      assert.equal(error.details.preserved, true)
+      assert.ok(error.details.entries.some(entry => entry.includes('.env')))
+      return true
+    },
+  )
+  assert.equal(fs.readFileSync(path.join(record.path, '.env'), 'utf8'), 'SECRET=keep-me\n')
+  assert.equal(fs.existsSync(path.join(record.path, 'cache', 'build.bin')), true)
+
+  fs.rmSync(path.join(record.path, '.env'))
+  fs.rmSync(path.join(record.path, 'cache'), { recursive: true })
+  const removed = await service.rollback({ rootAgent: agent, record, active: false })
+  assert.equal(removed.status, 'removed')
 })
 
 test('rollback preserves a branch with commits and reports manual recovery', async (t) => {
