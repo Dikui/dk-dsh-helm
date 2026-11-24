@@ -9,11 +9,13 @@
 //   frozen argv (never a shell), hooks/filters/fsmonitor disabled;
 // - the optional services are resolved lazily, so the Swarm plugin still loads
 //   on hosts that do not provide them (prepare/merge then fail closed);
-// - merge is fast-forward only, never forced, never deletes the member branch
-//   or worktree, and refuses dirty / stale / active / identity-mismatched state;
+// - merge is fast-forward only of the exact verified member commit, never
+//   forced, never deletes the member branch or worktree, and refuses dirty /
+//   stale / active / identity-mismatched state;
 // - rollback removes only a clean, registered, identity-matched worktree with a
-//   non-force `git worktree remove`; a branch is deleted only when its tip is
-//   still exactly the recorded base commit.
+//   non-force `git worktree remove`; ignored files count as user data, so a
+//   worktree containing them is preserved; a branch is deleted only when its
+//   tip is still exactly the recorded base commit.
 import { randomBytes } from 'node:crypto'
 import { HostError, isPlainObject, truncateText } from './host-format.js'
 
@@ -711,7 +713,10 @@ export class SwarmWorktrees {
     try {
       await this.git(rootAgent, {
         cwd: repo.repositoryRoot,
-        args: ['merge', '--ff-only', '--no-stat', '--no-overwrite-ignore', `refs/heads/${record.branch}`],
+        // Merge the exact commit that was verified above, not the branch name:
+        // another process could move refs/heads/<branch> between the checks and
+        // this command, which would deliver an unverified tip.
+        args: ['merge', '--ff-only', '--no-stat', '--no-overwrite-ignore', memberHead],
         env: overrides,
         write: true,
         signal,
@@ -766,6 +771,8 @@ export class SwarmWorktrees {
     }
     const now = Date.now()
     const updated = { ...record, status: 'merged', mergedHead: memberHead, mergedAt: now, updatedAt: now }
+    const memberBranchHead = await this.resolveCommitOrNull(rootAgent, repo.repositoryRoot, `refs/heads/${record.branch}`, signal)
+    const branchMoved = memberBranchHead !== memberHead
     return {
       status: 'merged',
       strategy: 'ff-only',
@@ -776,6 +783,13 @@ export class SwarmWorktrees {
       targetHead: newHead,
       baseCommit: record.baseCommit,
       worktreePath: record.path,
+      ...(branchMoved
+        ? {
+          branchMoved: true,
+          memberBranchHead,
+          warning: 'the member branch moved after verification; the verified commit was delivered, but newer branch commits were not',
+        }
+        : {}),
       record: updated,
     }
   }
@@ -851,6 +865,19 @@ export class SwarmWorktrees {
         entries: statusEntries(memberStatus.fields),
         count: memberStatus.fields.length,
         truncated: memberStatus.truncated,
+        preserved: true,
+      })
+    }
+    // git status treats ignored files as clean, but `git worktree remove`
+    // deletes them. Refuse rather than destroy caches, .env files, or other
+    // user artifacts that happen to be ignored.
+    const ignoredStatus = await this.scanStatus(rootAgent, path, signal, 20, null, true)
+    if (ignoredStatus.fields.length > 0) {
+      throw fail('WORKTREE_HAS_IGNORED', 'the member worktree contains ignored files; rollback will not delete them', {
+        worktreePath: path,
+        entries: statusEntries(ignoredStatus.fields),
+        count: ignoredStatus.fields.length,
+        truncated: ignoredStatus.truncated,
         preserved: true,
       })
     }
@@ -959,6 +986,8 @@ export class SwarmWorktrees {
       if (entry.locked || entry.prunable) return { reaped: false, reason: 'locked-or-prunable' }
       const status = await this.scanStatus(rootAgent, path, signal, 1)
       if (status.fields.length > 0) return { reaped: false, reason: 'dirty' }
+      const ignored = await this.scanStatus(rootAgent, path, signal, 1, null, true)
+      if (ignored.fields.length > 0) return { reaped: false, reason: 'ignored' }
       await this.git(rootAgent, {
         cwd: repositoryRoot,
         args: ['worktree', 'remove', '--', path],
@@ -1203,9 +1232,10 @@ export class SwarmWorktrees {
     return entries
   }
 
-  async scanStatus(rootAgent, cwd, signal, max = 20, pathspec = null) {
+  async scanStatus(rootAgent, cwd, signal, max = 20, pathspec = null, ignored = false) {
     const fields = []
     const args = ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignore-submodules=none']
+    if (ignored) args.push('--ignored=matching')
     if (pathspec) args.push('--', pathspec)
     const stopped = await this.host.scan(rootAgent, {
       cwd,
@@ -1339,7 +1369,8 @@ function createDshHost(ctx, config, logger) {
           throw fail('CWD_UNAVAILABLE', 'the lead workspace could not be resolved', { cause: truncateText(error?.message, 200) })
         }
         if (typeof cwd === 'string' && cwd.length > 0) return cwd
-        throw fail('CWD_UNAVAILABLE', 'the lead workspace is not available')
+        // Older working-directory services returned void from ensure(); fall
+        // through to get()/the session header instead of failing.
       }
       if (workingDirectory && typeof workingDirectory.get === 'function') {
         try {
