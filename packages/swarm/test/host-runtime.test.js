@@ -117,6 +117,13 @@ test('installed runtime: /swarm command, four-tool gating, wake delivery and dur
 
     assert.equal((await command(root, '/swarm init Host Runtime')).kind, 'success');
     assert.deepEqual(await toolNames(root), ['swarm']);
+    // Optional capabilities never turn a missing sandbox/route into shared or inherited dispatch.
+    assert.equal((await command(root, '/swarm add blocked --worktree -- do not spawn')).kind, 'error');
+    const deniedRoute = await invoke(root, 'swarm', { action: 'add', name: 'blocked', prompt: 'do not spawn', modelRoute: { provider: 'unavailable', model: 'm' } });
+    assert.equal(deniedRoute.value.ok, false);
+    const wallet = await command(root, '/swarm quota');
+    assert.equal(wallet.kind, 'success');
+    assert.equal(JSON.parse(wallet.text).supported, false);
     const kickoff = postedSeq(await command(root, '/swarm post Kickoff for the team'));
     assert.equal((await command(root, '/swarm add worker-1 do the task')).kind, 'success');
     releaseGate();
