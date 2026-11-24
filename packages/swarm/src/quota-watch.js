@@ -34,8 +34,8 @@ export class WalletAlerts {
         const key = `${watch.currency}:${watch.threshold}`;
         if (Number(amount) > watch.threshold) this.alerted.delete(rootId);
         else if (this.alerted.get(rootId) !== key) {
-          await this.host.steerRoot(rootId, `DeepSeek account recharge wallet: ${amount} ${watch.currency}, at or below your ${watch.threshold} ${watch.currency} alert. Bonus credits are separate; this is not a remaining-quota percentage.`, 'Swarm balance alert');
-          this.alerted.set(rootId, key);
+          const delivered = await this.host.steerRoot(rootId, `DeepSeek account recharge wallet: ${amount} ${watch.currency}, at or below your ${watch.threshold} ${watch.currency} alert. Bonus credits are separate; this is not a remaining-quota percentage.`, 'Swarm balance alert');
+          if (delivered) this.alerted.set(rootId, key);
         }
       }
     } finally { this.busy = false; }

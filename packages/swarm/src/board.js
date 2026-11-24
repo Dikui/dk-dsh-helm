@@ -1743,8 +1743,9 @@ export function transition(board, actorSessionId, action) {
       const target = memberBySession(draft, action.target);
       if (actor?.role !== 'coordinator') outcome = fail(ERRORS.FORBIDDEN, 'coordinator only');
       else if (target?.status !== 'killed' || !target.worktree || target.worktree.id !== action.worktreeId) outcome = fail(ERRORS.INVALID_ARGUMENT, 'checkout mismatch');
+      else if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(action.mergedHead) || !Number.isSafeInteger(action.mergedAt)) outcome = fail(ERRORS.INVALID_ARGUMENT, 'invalid delivery receipt');
       else {
-        target.worktree = { ...target.worktree, status: 'merged', updatedAt: action.updatedAt };
+        target.worktree = { ...target.worktree, status: 'merged', mergedHead: action.mergedHead, mergedAt: action.mergedAt, updatedAt: action.mergedAt };
         outcome = ok({ member: memberView(draft, target) });
       }
       break;

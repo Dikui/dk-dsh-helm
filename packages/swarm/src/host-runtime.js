@@ -947,9 +947,10 @@ export class SwarmHost {
     if (member.status !== 'killed' || this.handles.has(id) || this.sendsInFlight.has(id) || this.unconfirmedDisposals.get(rootId)?.has(id) || this.ctx.agents.get(id)) {
       throw failure('MEMBER_ACTIVE', 'kill the member and wait for its activation to disappear before merging');
     }
-    if (member.worktree.status === 'merged') return { status: 'already-delivered', branch: member.worktree.branch };
+    if (member.worktree.status === 'merged') return { status: 'already-delivered', branch: member.worktree.branch, mergedHead: member.worktree.mergedHead };
     const delivery = await (await this.gitWorktrees()).merge({ rootAgent, record: member.worktree, active: false, signal });
-    const out = await this.state.act(rootId, rootId, { type: 'recordMerge', target: id, worktreeId: member.worktree.id, updatedAt: delivery.record.updatedAt });
+    const { mergedHead, mergedAt } = delivery.record;
+    const out = await this.state.act(rootId, rootId, { type: 'recordMerge', target: id, worktreeId: member.worktree.id, mergedHead, mergedAt });
     if (!out.result?.ok) throw failure('DELIVERY_RECORD_FAILED', 'Git succeeded but the board update failed; retry merge to reconcile');
     return delivery;
   }

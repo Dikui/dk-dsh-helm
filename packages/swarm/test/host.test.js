@@ -224,7 +224,7 @@ test('isolated dispatch persists the delivery record, rejects live/non-root merg
   let deliveries = 0;
   rt.host.worktrees = {
     prepare: async ({ memberSessionId, memberName, rootAgent }) => ({ version: 1, id: 'wt_1', rootSessionId: rootAgent.id, member: memberName, memberSessionId, status: 'prepared', path: '/repo/checkout', branch: 'swarm/alice' }),
-    merge: async ({ record, active }) => { assert.equal(active, false); deliveries++; return { status: 'merged', record: { ...record, status: 'merged', updatedAt: 42 } }; },
+    merge: async ({ record, active }) => { assert.equal(active, false); deliveries++; return { status: 'merged', record: { ...record, status: 'merged', mergedHead: 'a'.repeat(40), mergedAt: 42, updatedAt: 42 } }; },
   };
   const { sessionId } = await rt.host.addMember({ rootAgent: rt.root, name: 'alice', prompt: 'write code', workspaceMode: 'branch' });
   assert.equal(rt.spawns[0].cwd, '/repo/checkout');
@@ -278,12 +278,15 @@ test('wallet monitoring is root opt-in, deduplicated per crossing, and ignores u
   let amount = '2.50', reads = 0;
   rt.host.quotaAdvisory = async () => { reads++; return { supported: true, signedIn: true, balances: [{ currency: 'CNY', amount, wallet: 'recharge' }, { currency: 'CNY', amount: '100', wallet: 'bonus' }] }; };
   const alerts = [];
-  rt.host.steerRoot = async (_root, message) => alerts.push(message);
+  let deliverable = false;
+  rt.host.steerRoot = async (_root, message) => { if (!deliverable) return false; alerts.push(message); return true; };
   await rt.host.walletAlerts.poll();
   assert.equal((await command('swarm quota', rt.agents.get(sessionId))).kind, 'error');
   assert.equal((await command('swarm quota watch CNY -1')).kind, 'error');
   assert.equal(reads, 0);
   assert.equal((await command('swarm quota watch CNY 5')).kind, 'success');
+  await rt.host.walletAlerts.poll(); // disconnected after the account snapshot
+  deliverable = true;
   await rt.host.walletAlerts.poll(); await rt.host.walletAlerts.poll();
   assert.equal(alerts.length, 1);
   amount = '8'; await rt.host.walletAlerts.poll();
