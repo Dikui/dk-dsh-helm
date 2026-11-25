@@ -1141,7 +1141,7 @@ function statusOf(draft, actor) {
   return ok({
     title: draft.title,
     plan: clone(draft.plan),
-    deliveries: clone(draft.deliveries),
+    deliveries: clone(actor.role === 'coordinator' ? draft.deliveries : draft.deliveries.filter(d => d.owner === actor.sessionId)),
     seq: draft.seq,
     headSeq: draft.seq,
     members,

@@ -71,6 +71,7 @@ test('only the live owner submits; an ordinary [done] post is not a submission',
   const peer = apply(posted, LEAD, {
     type: 'add', member: { sessionId: 'observer', name: 'observer', role: 'monitor' },
   }).state;
+  assert.deepEqual(apply(peer, 'observer', {type:'status'}).result.deliveries, []);
   rejects(peer, 'observer', { ...submit, owner: OWNER }, 'FORBIDDEN');
   rejects(peer, 'observer', { ...assign, taskId: 'other' }, 'FORBIDDEN');
   rejects(posted, 'new-session', submit, 'NOT_MEMBER');

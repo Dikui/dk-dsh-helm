@@ -559,8 +559,15 @@ test('external seat exchanges scoped snapshots, durable receipts and versioned s
   const message = {op:'post',text:'hello from external'};
   const {id} = await enqueueMailbox(mailbox,message);
   await enqueueMailbox(mailbox,{op:'submit',taskId:'report',artifactVersion:'rev-a',artifactPath:'report.md'});
+  const deniedChannel = await enqueueMailbox(mailbox,{op:'post',text:'not allowed',channel:'private'});
+  const notAssigned = await enqueueMailbox(mailbox,{op:'submit',taskId:'other',artifactVersion:'x',artifactPath:'x.md'});
+  const forged = randomUUID();
+  await writeFile(path.join(mailbox,'inbox',forged+'.json'), JSON.stringify({op:'post',text:'forged',author:'lead'}));
   await run('external sync remote');
   assert.equal((await readMailboxAck(mailbox,id)).ok,true);
+  assert.equal((await readMailboxAck(mailbox,deniedChannel.id)).code,'NOT_SUBSCRIBED');
+  assert.equal((await readMailboxAck(mailbox,notAssigned.id)).code,'NOT_FOUND');
+  assert.equal((await readMailboxAck(mailbox,forged)).code,'INVALID_REQUEST');
   // Replay across a lost disk acknowledgement: the board is the receipt authority.
   await writeFile(path.join(mailbox,'acks.json'),'[]');
   await writeFile(path.join(mailbox,'inbox',id+'.json'),JSON.stringify(message));
@@ -594,7 +601,11 @@ test('only the lead may configure clocks or explicitly confirm a paid probe', as
   let dispatched = 0;
   rt.root.session.snapshotEvents = () => [];
   rt.root.session.requestHeader = () => ({config:{provider:'p',model:'m'}});
-  rt.ctx.llm = {prepareCall:async () => {dispatched++;return {config:{},stream:async function*(){yield {type:'finish',reason:{kind:'stop'}};}}}};
+  rt.ctx.llm = {prepareCall:async config => {dispatched++;return {config,stream:async function*(){yield {type:'finish',reason:{kind:'stop'}};}}}};
+  registerSwarmTools(rt.host);
+  const coordinatorTool = rt.tools.find(t => t.definition.name === 'swarm').definition;
+  assert.equal((await coordinatorTool.execute({action:'probe',confirmPaid:true},{agent:rt.root})).ok,false);
+  assert.equal((await run(rt.root,'add bob check documentation')).kind,'success');
   assert.equal((await run(rt.root,'probe p/m')).kind,'error');
   assert.equal((await run(worker,'probe p/m --confirm-paid')).kind,'error');
   assert.equal(dispatched,0);

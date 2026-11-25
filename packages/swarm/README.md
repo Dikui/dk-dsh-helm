@@ -20,11 +20,58 @@ Swarm 让同一棵 DSH 子代理树里的成员围绕一个持久黑板协作：
 
 成员调用 `read_board` 阅读对自己可见的帖子，调用 `post_message` 公布结果；已经读完时调用 `swarm_wait` 结束当前回合，而不是循环等待。`@name` 是门铃，不是普通抄送。`/swarm finish` 停用团队成员并保留黑板；不会撤销成员已经写入的文件。`read_board` 按最终渲染的 JSON 分页（`hasMore` 为 true 时继续读，单篇合法帖子即使转义后超过上限也会完整返回），无参数 `/swarm finish` 会先取消并等待同一根会话上正在启动的成员，再停用剩余名单。
 
+## 交付物与验收
+
+自由发帖不用建任务；要追踪验收时，单独给成员一份交付约定。以下例子中，`submit` 由 scout 执行，`review` 由 lead 核查产物后执行：
+
+```text
+/swarm assign boundary scout "一份输入边界报告" "给出空输入的复现步骤和预期结果"
+/swarm submit boundary v1 docs/boundary.md
+/swarm deliveries boundary
+/swarm review boundary 1 returned failed "v1 没说明空输入的预期结果"
+/swarm submit boundary v2 docs/boundary.md
+/swarm review boundary 2 accepted passed "已按 v2 步骤复现，预期结果与实际一致"
+```
+
+`/swarm deliveries` 分页列出任务；`/swarm deliveries <taskId>` 看判据、当前版本/路径和最新评审。模型可使用同名流程的 `swarm_delivery` 工具；成员只能看和提交自己的任务。编号是**任务内提交序号**，不是黑板帖子序号；重提后旧编号不能验收。lead 必须写明检查结果与依据，失败不能标为通过。它记录验收，不会打开成员给出的路径或执行命令。`done` 发帖、`finish` 停用、`merge` 快进都不等于验收。每板最多 128 份合约，保留当前提交与最新评审，不是完整审计日志。
+
+## 截止时间与静默提醒
+
+```text
+/swarm clock deadline 2030-06-15T17:00:00+08:00
+/swarm clock silence 15
+/swarm clock
+/swarm clock off
+```
+
+两项默认均关闭，可分别用 `deadline off` 或 `silence off` 关闭。截止时间必须带 `Z` 或偏移量；静默窗口单位为分钟。仍有任务时，即使成员显示工作中，没有新帖子或交付进展也能提醒 lead；全员停等仍单独诊断。提醒由周期扫描触发，不是精确定时器，不判失败、不停进程。成功投递的同一事件去重；若发送后尚未保存回执就崩溃，重启后可能再次提醒。
+
 ## 按需指定模型与余额预警
 
 `/swarm add <名字> --model <provider/model> --fallback <另一个 provider/model> -- <任务>` 显式指定主模型和一次性备用；不传 `--model` 仍继承 lead。模型 ID 可以包含 `/`，两个路由都必须获得当前会话的子代理路由授权并在宿主可用。确定的额度耗尽才尝试切换；普通限流不是余额，不能据此推算“还剩 10%”。续跑沿用同一成员、历史和工作目录，开启新回合，不重放旧工具调用。收到宿主明确的额度耗尽错误时，没有备用、备用未获授权或切换失败都会暂停该成员并通知 lead；普通限流累计 3 次才暂停，不消耗备用。
 
 `/swarm quota` 由根会话查看 **DeepSeek 一方账号**提供的真钱包金额或不可用原因，不是任意模型服务商的额度查询。`/swarm quota watch CNY 5` 表示当人民币**充值钱包**余额不高于 5 元时提醒；也可用 USD。监控是显式开启、按黑板保存的；有可接收通知的 lead 和未停用成员时，每分钟检查一次，不用模型。不同币种、赠送钱包不相加，不知道金额时不报零，不因余额提醒自动换模型。`/swarm quota off` 关闭。宿主重启后，仍低于阈值可能再次提醒。
+
+需要确认上游此刻能否响应时，lead 可显式执行 `/swarm probe <provider/model> --confirm-paid`。它只探测**一条获授权的路由**，发送固定短提示，不带会话内容或工具，不重试、不改路由、不派工；这一次请求**可能计费**。结果区分成功、额度、限流、容量、鉴权、超时等；成功不是未来容量保证，超时也不保证服务商没有计费。普通 `add` 不会自动做这个实测。
+
+## 外部机器或其他 CLI 参与
+
+外部成员不需要成为 DSH 子会话。Swarm 仍只有一个写黑板的 Host：外部 CLI 通过**独立席位信箱**读可见快照、排队发帖或提交版本，lead 明确同步后才有回执。插件不会启动远端进程、监听网络、分发凭据或同步代码。
+
+1. 由管理员预先建立专用空目录：Host 用户拥有、权限 `0700`、规范绝对路径、祖先不可由非信任主体改写。根会话运行 `/swarm external add remote /absolute/private/swarm-mailboxes`，保存返回的 `mailbox` 路径。**不要共享整个基目录、工程目录或 DSH 配置目录。**
+2. lead 执行 `/swarm assign report remote "提交报告" "列出来源"` 和 `/swarm external sync remote`。经受限 SSH 或保留 POSIX 权限和原子重命名语义的挂载，仅授权该成员访问自己的席位：读取快照和回执、写入其 `inbox`。不得授予修改席位根或父目录的权限；为收件目录配置磁盘配额。不同席位不要共用拥有 Host 权限的账号。
+3. 在同一席位的受限环境下使用包内 `bin/swarm-seat.js`，以 `SEAT` 指代该成员看到的绝对路径：
+
+   ```sh
+   node bin/swarm-seat.js "$SEAT" read
+   node bin/swarm-seat.js "$SEAT" post '我开始核查来源' main
+   node bin/swarm-seat.js "$SEAT" submit report v1 docs/report.md
+   node bin/swarm-seat.js "$SEAT" ack <请求UUID>
+   ```
+
+4. lead 再执行 `/swarm external sync remote` 处理请求并刷新快照，然后用 `/swarm deliveries report` 验收。CLI 返回 `queued` 只是入队；`ack` 才表示 Host 已处理。连接中断后用原请求 ID 查回执或重试同步，不要重新创建一次提交。快照只含该席位可见的最近 32 帖和自己的约定；不推进 DSH 原生已读游标。
+
+`pause`/`kill` 后 Host 拒绝该席位后续同步，无法收回已读取的数据或删除已排队文件；撤销 SSH/挂载权限、清理旧文件由管理员负责。每次同步最多处理 32 项；磁盘保留最近 256 条回执，已过期的 `ack` 查询也可能显示 `pending`。黑板每席位至多记录 512 个已处理请求 ID（成功或业务拒绝），不会驱逐旧 ID 后重复写入；满额请停用旧席位，换新名字、新信箱，并为未完成工作另派任务。不支持所需文件权限语义的平台请在受限 POSIX 主机运行席位 CLI，不要放宽目录权限。
 
 ## 并行修改同一个 Git 仓库
 
