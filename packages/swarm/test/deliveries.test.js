@@ -72,7 +72,7 @@ test('only the live owner submits; an ordinary [done] post is not a submission',
     type: 'add', member: { sessionId: 'observer', name: 'observer', role: 'monitor' },
   }).state;
   assert.deepEqual(apply(peer, 'observer', {type:'status'}).result.deliveries, []);
-  rejects(peer, 'observer', { ...submit, owner: OWNER }, 'FORBIDDEN');
+  rejects(peer, 'observer', { ...submit, owner: OWNER }, 'NOT_FOUND'); // Out of scope and nonexistent look identical.
   rejects(peer, 'observer', { ...assign, taskId: 'other' }, 'FORBIDDEN');
   rejects(posted, 'new-session', submit, 'NOT_MEMBER');
   rejects(posted, OWNER, { ...submit, taskId: 'unknown' }, 'NOT_FOUND');
@@ -97,6 +97,29 @@ test('only the live owner submits; an ordinary [done] post is not a submission',
   assert.deepEqual(next.state.pendingWakes, posted.pendingWakes);
 });
 
+test('a path or a commit alone identifies the exact submission; ambiguous or empty references fail closed', () => {
+  const board = apply(members(), LEAD, assign).state;
+  const submitRef = { type: 'submitDelivery', taskId: assign.taskId };
+  for (const refs of [
+    {}, { artifactVersion: 'v2' }, { artifactCommit: 'main' }, { artifactCommit: 'abc123' },
+    { artifactPath: ' ' }, { artifactPath: 'a\nb' }, { artifactCommit: null },
+    { artifactCommit: 'deadbeef', artifactPath: 'map' }, { artifactCommit: 'deadbeef', artifactVersion: 'v1' },
+  ]) rejects(board, OWNER, { ...submitRef, ...refs }, 'INVALID_ARGUMENT');
+  for (const [refKind, refs] of [
+    ['path', { artifactPath: 'maps/station map.svg' }], ['commit', { artifactCommit: 'deadbeef' }],
+  ]) {
+    const pending = apply(board, OWNER, { ...submitRef, ...refs }).state;
+    assert.deepEqual(pending.deliveries[0].submission, { seq: 1, refKind, ...refs });
+    rejects(pending, LEAD, { ...review, artifactCommit: 'badcafe' }, 'INVALID_STATE');
+    rejects(pending, LEAD, { ...review, artifactPath: 'wrong-path' }, 'INVALID_STATE');
+    const accepted = apply(pending, LEAD, { ...review, ...refs }).result.delivery;
+    assert.deepEqual(accepted.review, {
+      submittedSeq: 1, refKind, ...refs, decision: 'accepted', checkPassed: true,
+      evidence: review.evidence, reviewer: LEAD,
+    });
+  }
+});
+
 test('a review consumes exactly the current submission and binds the manual finding to its artifact', () => {
   const assigned = apply(members(), LEAD, assign).state;
   rejects(assigned, LEAD, review, 'INVALID_STATE');
@@ -118,6 +141,7 @@ test('a review consumes exactly the current submission and binds the manual find
   rejects(returned.state, LEAD, review, 'INVALID_STATE');
   const second = apply(returned.state, OWNER, { ...submit, artifactVersion: 'rev-B' }).state;
   assert.equal(second.deliveries[0].review, null, 'new artifact has no previous manual verdict');
+  assert.deepEqual(second.deliveries[0].lastReturn, returned.result.delivery.review, 'prior evidence and its exact submission survive resubmission');
   const third = apply(second, OWNER, { ...submit, artifactVersion: 'rev-C', artifactPath: 'out/final.svg' }).state;
   rejects(third, LEAD, review, 'INVALID_STATE');
   rejects(third, LEAD, { ...review, submittedSeq: 2 }, 'INVALID_STATE');
@@ -126,6 +150,7 @@ test('a review consumes exactly the current submission and binds the manual find
   const accepted = apply(third, LEAD, { ...review, submittedSeq: 3, now: 50 });
   assert.equal(accepted.result.delivery.status, 'accepted');
   assert.equal(accepted.result.delivery.updatedAt, 50);
+  assert.deepEqual(accepted.result.delivery.lastReturn, returned.result.delivery.review);
   assert.deepEqual(accepted.result.delivery.review, {
     decision: 'accepted', checkPassed: true, evidence: review.evidence, reviewer: LEAD,
     submittedSeq: 3, artifactVersion: 'rev-C', artifactPath: 'out/final.svg',

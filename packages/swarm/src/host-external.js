@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { isValidMemberName } from './channels.js';
 import { failure } from './host-format.js';
 import { publicDelivery } from './host-deliveries.js';
+import { visibleDeliveries } from './deliveries.js';
 import { createMailbox, syncMailbox } from './external-bridge.js';
 
 // No listener or shell. The human chooses the directory; models cannot provision or sync seats.
@@ -40,7 +41,7 @@ export async function syncExternal(host, agent, name) {
       return {v:1, name:member.name, channels:member.channels, seq:board.seq,
         messages:posts.slice(-32).map(({seq,name:author,channel,text}) => ({seq,author,channel,text})),
         earlierVisiblePosts:Math.max(0, posts.length-32),
-        deliveries:(board.deliveries ?? []).filter(d => d.owner === member.sessionId).map(d => publicDelivery(board,d))};
+        deliveries:visibleDeliveries(board, member).map(d => publicDelivery(board,d))};
     },
     async consume(request) {
       current();

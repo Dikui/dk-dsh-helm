@@ -9,6 +9,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createMailbox, syncMailbox } from '../src/external-bridge.js';
 
+const posix = typeof process.getuid === 'function' && process.platform !== 'win32';
+const seatTest = (name, run) => test(name, { skip: !posix && 'requires POSIX seats' }, run);
+if (!posix) test('mailboxes reject unsupported platforms without touching the filesystem', async () => {
+  await assert.rejects(createMailbox('/unsupported'), { code: 'POSIX_REQUIRED' });
+});
 const cli = fileURLToPath(new URL('../bin/swarm-seat.js', import.meta.url));
 const exec = promisify(execFile);
 async function command(seat, ...args) {
@@ -21,7 +26,7 @@ async function fixture(t) {
   return { base, seat: await createMailbox(base) };
 }
 
-test('independent CLI reads its assigned view; queueing, consumption and receipt are distinct', async t => {
+seatTest('independent CLI reads its assigned view; queueing, consumption and receipt are distinct', async t => {
   const { base, seat } = await fixture(t);
   const peer = await createMailbox(base);
   const view = { posts: [], tasks: [{ id: 'task-1', assignee: 'sam' }] };
@@ -44,9 +49,35 @@ test('independent CLI reads its assigned view; queueing, consumption and receipt
   const submit = await command(seat, 'submit', 'task-1', 'v1.2', 'out/result.md');
   await sync();
   assert.deepEqual(received[1], { id: submit.id, op: 'submit', taskId: 'task-1', artifactVersion: 'v1.2', artifactPath: 'out/result.md' });
+  const nextId = randomUUID();
+  await command(seat, 'submit', 'task-1', '--commit', 'abc4321', '--after', '1', '--id', nextId);
+  await sync();
+  assert.deepEqual(received[2], {id:nextId, op:'submit', taskId:'task-1', artifactCommit:'abc4321', after:1});
+  await assert.rejects(command(seat, 'submit', 'task-1', '--path', '/tmp/result', '--after', '2'), /INVALID_REQUEST/);
 });
 
-test('Host sync rejects an unsafe inbox/base before observing input or publishing board data', async t => {
+seatTest('a remote caller can choose its submission ID before a lost CLI reply and safely retry', async t => {
+  const { seat } = await fixture(t);
+  const id = randomUUID();
+  const args = ['submit', 'report', 'v1', 'docs/report.md', '--id', id];
+  await command(seat, ...args); // The connection drops before this result reaches the caller.
+  const queued = await command(seat, ...args);
+  assert.deepEqual(queued, { id, queued: true });
+  let applied = 0;
+  const sync = () => syncMailbox(seat, { snapshot: () => ({}), consume: () => ({ ok: true, seq: ++applied }) });
+  await sync();
+  await command(seat, ...args);
+  await sync();
+  assert.equal(applied, 1);
+  assert.deepEqual(await command(seat, 'ack', id), { id, ok: true, seq: 1 });
+  await assert.rejects(command(seat, 'post', 'changed', '--id', id), /ID_CONFLICT/);
+  await assert.rejects(command(seat, 'post', 'message', '--id', 'not-a-uuid'), /INVALID_REQUEST/);
+  const clash = randomUUID();
+  await command(seat,'post','one','--id',clash);
+  await assert.rejects(command(seat,'post','two','--id',clash), /ID_CONFLICT/);
+});
+
+seatTest('Host sync rejects an unsafe inbox/base before observing input or publishing board data', async t => {
   const { base, seat } = await fixture(t);
   const inbox = path.join(seat, 'inbox');
   const sync = () => syncMailbox(seat, { snapshot: () => ({}), consume: assert.fail });
@@ -74,7 +105,7 @@ test('Host sync rejects an unsafe inbox/base before observing input or publishin
   await assert.rejects(command(mount, 'post', 'not through a mutable mount parent'), /UNSAFE_PATH/);
 });
 
-test('malformed input, special files and forged identity never reach the consumer or block a valid peer message', async t => {
+seatTest('malformed input, special files and forged identity never reach the consumer or block a valid peer message', async t => {
   const { seat } = await fixture(t);
   const inbox = path.join(seat, 'inbox');
   const sentinel = path.join(seat, 'sentinel');
@@ -104,7 +135,7 @@ test('malformed input, special files and forged identity never reach the consume
   await assert.rejects(command(seat, 'submit', 'task', 'v1', '/absolute/path'));
 });
 
-test('after a committed consume throws, replay retains request identity and cannot double-apply an idempotent Host transaction', async t => {
+seatTest('after a committed consume throws, replay retains request identity and cannot double-apply an idempotent Host transaction', async t => {
   const { seat } = await fixture(t);
   const { id } = await command(seat, 'post', 'once');
   const receiptFile = path.join(seat, 'test-host-ledger');
@@ -132,14 +163,18 @@ test('after a committed consume throws, replay retains request identity and cann
   await sync();
   assert.equal(attempts, 2);
   assert.deepEqual(JSON.parse(await readFile(receiptFile, 'utf8')).posts, ['once']);
-  // Residual envelope after ACK but before unlink uses the cached ack.
-  await writeFile(path.join(seat, 'inbox', id + '.json'), JSON.stringify({ op: 'post', text: 'changed' }));
+  // Only identical envelopes reuse the cached success, including direct protocol clients.
+  const envelope = path.join(seat, 'inbox', id + '.json');
+  await writeFile(envelope, JSON.stringify({ op: 'post', text: 'once' }));
+  await sync();
+  assert.deepEqual(await command(seat, 'ack', id), { id, ok: true, seq: 1 });
+  await writeFile(envelope, JSON.stringify({ op: 'post', text: 'changed' }));
   await sync();
   assert.equal(attempts, 2);
-  assert.deepEqual(await command(seat, 'ack', id), { id, ok: true, seq: 1 });
+  assert.deepEqual(await command(seat, 'ack', id), { id, ok: false, code:'ID_CONFLICT' });
 });
 
-test('only one sync per seat; work per call is bounded; failed or oversized view publication is not partial', async t => {
+seatTest('only one sync per seat; work per call is bounded; failed or oversized view publication is not partial', async t => {
   const { seat } = await fixture(t);
   const inbox = path.join(seat, 'inbox');
   await Promise.all(Array.from({ length: 34 }, () => writeFile(path.join(inbox, randomUUID() + '.json'), '{"op":"post","text":"hi"}')));

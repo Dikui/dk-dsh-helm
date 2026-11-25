@@ -556,6 +556,9 @@ test('external seat exchanges scoped snapshots, durable receipts and versioned s
   assert.deepEqual(view.messages.map(m => [m.author,m.text]), [['lead','hello remote']]);
   assert.deepEqual(view.deliveries.map(d => [d.owner,d.status]), [['remote','assigned']]);
   assert.ok(!JSON.stringify(view).includes('seat-'));
+  const unicodeId = '界'.repeat(60);
+  await run(`assign ${unicodeId} remote "报告" "包含来源"`);
+  const unicodeRequest = await enqueueMailbox(mailbox,{op:'submit',taskId:unicodeId,artifactVersion:'v1',artifactPath:'报告.md'});
   const message = {op:'post',text:'hello from external'};
   const {id} = await enqueueMailbox(mailbox,message);
   await enqueueMailbox(mailbox,{op:'submit',taskId:'report',artifactVersion:'rev-a',artifactPath:'report.md'});
@@ -564,8 +567,9 @@ test('external seat exchanges scoped snapshots, durable receipts and versioned s
   const forged = randomUUID();
   await writeFile(path.join(mailbox,'inbox',forged+'.json'), JSON.stringify({op:'post',text:'forged',author:'lead'}));
   await run('external sync remote');
+  assert.deepEqual(await readMailboxAck(mailbox,unicodeRequest.id),{id:unicodeRequest.id, ok:true, seq:1});
   assert.equal((await readMailboxAck(mailbox,id)).ok,true);
-  assert.equal((await readMailboxAck(mailbox,deniedChannel.id)).code,'NOT_SUBSCRIBED');
+  assert.equal((await readMailboxAck(mailbox,deniedChannel.id)).code,'NOT_FOUND');
   assert.equal((await readMailboxAck(mailbox,notAssigned.id)).code,'NOT_FOUND');
   assert.equal((await readMailboxAck(mailbox,forged)).code,'INVALID_REQUEST');
   // Replay across a lost disk acknowledgement: the board is the receipt authority.
@@ -573,7 +577,22 @@ test('external seat exchanges scoped snapshots, durable receipts and versioned s
   await writeFile(path.join(mailbox,'inbox',id+'.json'),JSON.stringify(message));
   await run('external sync remote');
   assert.equal(rt.state.board('root').posts.filter(p => p.text === message.text).length,1);
-  await run('review report 1 accepted passed "read sources at rev-a"');
+  // Independent envelope IDs cannot make an old submit overwrite a newer revision.
+  const stale = await enqueueMailbox(mailbox,{op:'submit',taskId:'report',artifactVersion:'old',artifactPath:'report.md'});
+  const update = await enqueueMailbox(mailbox,{op:'submit',taskId:'report',artifactCommit:'1234abcd',after:1});
+  await run('external sync remote');
+  assert.equal((await readMailboxAck(mailbox,stale.id)).code,'STALE_SUBMISSION');
+  assert.deepEqual(await readMailboxAck(mailbox,update.id),{id:update.id,ok:true,seq:2});
+  // Even if the disk cache is lost, a changed retry cannot acquire the committed receipt.
+  await writeFile(path.join(mailbox,'acks.json'),'[]');
+  await enqueueMailbox(mailbox,{op:'post',text:'not the original'},id);
+  await run('external sync remote');
+  assert.equal((await readMailboxAck(mailbox,id)).code,'ID_CONFLICT');
+  assert.equal(rt.state.board('root').posts.some(p => p.text === 'not the original'),false);
+  await enqueueMailbox(mailbox,message,id);
+  await run('external sync remote');
+  assert.equal((await readMailboxAck(mailbox,id)).ok,true);
+  await run('review report 2 accepted passed "read sources at 1234abcd"');
   await run('reconcile');
   assert.equal(rt.state.memberByName('root','remote').status,'active');
   await run('pause remote');

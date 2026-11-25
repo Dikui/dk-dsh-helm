@@ -3,7 +3,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { enqueueMailbox, readMailboxAck } from '../src/external-bridge.js';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import * as plugin from '../index.js';
@@ -12,7 +14,7 @@ const runtime = process.env.DSH_TEST_RUNTIME;
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const postedSeq = result => Number(/seq (\d+)/.exec(result.text)[1]);
 
-test('installed runtime: /swarm command, four-tool gating, wake delivery and durable cursors', { skip: !runtime && 'Set DSH_TEST_RUNTIME to the installed resolver manifest' }, async () => {
+test('installed runtime: gated Swarm commands and tools, durable cursors and replay-safe external delivery', { skip: !runtime && 'Set DSH_TEST_RUNTIME to the installed resolver manifest' }, async () => {
   const require = createRequire(runtime);
   const { Context } = require('@deepseek-ai/cordis');
   const temp = await mkdtemp(path.join(tmpdir(), 'dk-swarm-host-'));
@@ -157,11 +159,32 @@ test('installed runtime: /swarm command, four-tool gating, wake delivery and dur
     assert.equal(view.seq, replySeq);
     assert.equal(view.members.find(member => member.name === 'worker-1').lastSeq, retried);
     assert.equal(view.members.find(member => member.name === 'lead').lastSeq, kickoff);
+    let seat, request, envelope;
+    if (process.platform !== 'win32') {
+      const base = path.join(await realpath(temp), 'remote-seats');
+      await mkdir(base, { mode: 0o700 });
+      seat = JSON.parse((await command(root, `/swarm external add remote "${base}"`)).text).mailbox;
+      assert.equal((await command(root, '/swarm assign checks remote "report" "include evidence"')).kind, 'success');
+      request = randomUUID();
+      envelope = { op: 'submit', taskId: 'checks', artifactVersion: 'v1', artifactPath: 'report.md' };
+      await enqueueMailbox(seat, envelope, request);
+      assert.equal((await command(root, '/swarm external sync remote')).kind, 'success');
+      // The seat loses the disk ACK; the board transaction must survive host teardown.
+      await writeFile(path.join(seat, 'acks.json'), '[]');
+    }
     await close();
     runtimeCtx = null;
 
     runtimeCtx = await boot();
     ({ command, invoke, root, close } = runtimeCtx);
+    if (seat) {
+      await enqueueMailbox(seat, envelope, request);
+      assert.equal((await command(root, '/swarm external sync remote')).kind, 'success');
+      assert.deepEqual(await readMailboxAck(seat, request), { id: request, ok: true, seq: 1 });
+      const { delivery } = JSON.parse((await command(root, '/swarm deliveries checks')).text);
+      assert.equal(delivery.submission.seq, 1);
+      assert.equal(delivery.status, 'submitted');
+    }
     const reopened = JSON.parse((await command(root, '/swarm view')).text);
     assert.equal(reopened.seq, replySeq);
     assert.equal(reopened.messages.at(-1).text, '@lead result ready');

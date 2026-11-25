@@ -87,6 +87,20 @@ test('an outstanding delivery owned by an active monitor counts as work even wit
   assert.deepEqual(kinds(board, 1200), []);
 });
 
+test('the coordinator can still review a submission after every worker has been killed', () => {
+  const board = team();
+  configureBoardClock(board, { deadlineUtc: '1970-01-01T00:00Z', silenceMs: 500 }, 0);
+  board.members.a.status = 'killed';
+  const task = { taskId: 'review', owner: 'a', status: 'submitted', updatedAt: 100, submission: { seq: 1 } };
+  board.deliveries = [task];
+  assert.deepEqual(kinds(board, 599), ['deadline']);
+  assert.deepEqual(kinds(board, 600), ['deadline', 'silence']);
+  for (const status of ['assigned', 'returned', 'accepted']) {
+    task.status = status;
+    assert.deepEqual(kinds(board, 1000), [], status);
+  }
+});
+
 test('the board can go quiet even while working; posts and delivery activity restart its quiet window', () => {
   const board = team();
   configureBoardClock(board, { silenceMs: 1000 }, 500);
@@ -144,7 +158,7 @@ test('re-enabling a clock cannot inherit the receipt of a notification still in 
   assert.deepEqual(kinds(board, 2005), ['deadline', 'silence']);
 });
 
-test('a parked board retains its independent stall hint unless its contracts are all accepted', () => {
+test('a parked board retains its independent stall hint alongside clocks', () => {
   const board = team();
   board.members.a.status = 'waiting';
   board.seq = 1;
@@ -157,6 +171,20 @@ test('a parked board retains its independent stall hint unless its contracts are
   assert.deepEqual(kinds(board, 301), ['deadline', 'silence']);
   board.deliveries = [{ taskId: 'evidence', status: 'accepted', updatedAt: 302 }];
   assert.deepEqual(kinds(board, 1000), []);
+});
+
+test('accepted contracts do not mask parked workers doing other, informal work', () => {
+  const board = team();
+  board.members.a.status = 'waiting';
+  board.members.b = { role: 'worker', name: 'bob', status: 'waiting', sessionId: 'b' };
+  board.deliveries = [{ taskId: 'prior', status: 'accepted', owner: 'a', updatedAt: 200 }];
+  board.seq = 1;
+  board.posts = [{ seq: 1, at: 300, sessionId: 'b', channel: 'main', kind: 'post', text: 'What next?' }];
+  configureBoardClock(board, { silenceMs: 1000, deadlineUtc: '1970-01-01T00:00Z' }, 100);
+  assert.deepEqual(kinds(board, 1300), ['stall']); // no overdue or quiet-contract warning
+  assert.equal(clock.diagnoseStall(board).key, '1:result');
+  board.posts.push({ seq: 2, at: 1400, sessionId: 'root', channel: 'main', kind: 'post', text: '[done] verified' });
+  assert.deepEqual(kinds(board, 1500), []); // legacy terminal marker still closes the stall
 });
 
 test('a monitor retries unconfirmed delivery, persists only success and stays quiet after restart', async () => {

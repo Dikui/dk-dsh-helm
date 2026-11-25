@@ -1,5 +1,5 @@
 import { READ_RENDER_LIMIT } from './board.js';
-import { asHostError, byteLength, failure, isPlainObject, truncateText } from './host-format.js';
+import { asHostError, byteLength, contractReceipt, failure, isPlainObject, truncateText } from './host-format.js';
 
 import { changeDelivery, listDeliveries } from './host-deliveries.js';
 
@@ -128,6 +128,11 @@ export function registerSwarmTools(host) {
           },
           name: { type: 'string', description: 'Member name for add; target name for kill/pause/resume.' },
           prompt: { type: 'string', description: 'Full initial task for a new member.' },
+          contract: { ...schema({
+            taskId: { type: 'string', minLength: 1, maxLength: 64 },
+            deliverable: { type: 'string', minLength: 1, maxLength: 1024 },
+            criterion: { type: 'string', minLength: 1, maxLength: 1024 },
+          }, ['taskId', 'deliverable', 'criterion']), description: 'For add: optional first-turn delivery contract. The new member owns it after joining; the lead reviews submissions.' },
           workspaceMode: { type: 'string', enum: ['share', 'branch'], description: 'For add: shared cwd (default) or an isolated Git worktree from committed HEAD.' },
           modelRoute: routeSchema('For add: authorized provider and model. Default inherits.'),
           fallbackRoute: routeSchema('For add: one authorized alternative to continue the same member after quota errors.'),
@@ -164,6 +169,7 @@ export function registerSwarmTools(host) {
                 rootAgent: exec.agent,
                 name: args.name,
                 prompt: args.prompt,
+                contract: args.contract,
                 role: args.role ?? 'worker',
                 channels: args.channels,
                 modelRoute: args.modelRoute,
@@ -174,7 +180,8 @@ export function registerSwarmTools(host) {
               return {
                 ok: true,
                 member: member.member,
-                message: `Added ${member.member.name}. Workspace: ${member.member.worktreePath ?? 'shared with the lead'}.`,
+                ...(member.taskId ? { taskId: member.taskId, notified: member.notified } : {}),
+                message: `Added ${member.member.name}. Workspace: ${member.member.worktreePath ?? 'shared with the lead'}.${contractReceipt(member)}`,
               };
             }
             case 'merge': {
@@ -259,11 +266,12 @@ export function registerSwarmTools(host) {
 
   register({
     name: 'swarm_delivery',
-    description: 'Optional delivery contracts. list (taskId for full details, offset for next page); the lead assigns to a member by name and reviews its exact submittedSeq after checking the artifact. Only the owner submits its version and path. A done post is not acceptance.',
+    description: 'Optional delivery contracts. list with taskId for details or offset for more tasks. The lead assigns to a member by name. The owner submits artifactPath (optionally with artifactVersion) or artifactCommit. The lead reviews the exact submittedSeq with manual evidence; any reference fields provided must match the submission. A done post is not acceptance.',
     parameters: schema({
       action: { type:'string', enum:['list','assign','submit','review'] },
       taskId:{type:'string'}, offset:{type:'integer',minimum:0}, owner:{type:'string'}, deliverable:{type:'string'}, criterion:{type:'string'},
-      artifactVersion:{type:'string'}, artifactPath:{type:'string'}, submittedSeq:{type:'integer',minimum:1},
+      artifactVersion:{type:'string'}, artifactPath:{type:'string'}, artifactCommit:{type:'string',description:'7–64 hexadecimal digits'},
+      submittedSeq:{type:'integer',minimum:1},
       decision:{type:'string',enum:['accepted','returned']}, checkPassed:{type:'boolean'}, evidence:{type:'string'},
     }, ['action']),
     output:{schema:OUTPUT, render:(_args, value) => jsonExact(value)}, isConcurrencySafe:false,

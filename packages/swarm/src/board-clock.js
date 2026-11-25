@@ -59,9 +59,7 @@ export function configureBoardClock(draft, patch, now) {
   return { ok: true, settings };
 }
 
-// Explicit contracts are authoritative, even after a historical [done] post.
-// Legacy boards have ordinary work and a coordinator-authored terminal marker.
-function unfinishedTeam(board) {
+function teamSnapshot(board) {
   if (!board || board.done === true) return null;
   const members = Object.values(board.members);
   const lead = members.find(member => member.role === 'coordinator');
@@ -70,20 +68,27 @@ function unfinishedTeam(board) {
   const posts = board.posts.filter(post => post.kind === 'post');
   const deliveries = board.deliveries ?? [];
   const outstanding = deliveries.filter(d => ['assigned', 'submitted', 'returned'].includes(d.status));
-  if (deliveries.length && !outstanding.length) return null;
-  if (!workers.length && !outstanding.some(d => {
+  const donePost = posts.some(post => post.sessionId === board.rootId && post.channel === 'main' &&
+    /^\[done\](?:\s|$)/i.test(post.text) && !/@/.test(post.text));
+  return { lead, workers, posts, deliveries, outstanding, donePost };
+}
+
+// Contracts govern the opt-in clocks, not the legacy parked-worker diagnosis.
+function hasClockWork(board, { workers, deliveries, outstanding, donePost }) {
+  if (!deliveries.length) return workers.length > 0 && !donePost;
+  if (workers.length) return outstanding.length > 0;
+  return outstanding.some(d => {
+    // Review is the coordinator's action; it does not need a live submitter.
+    if (d.status === 'submitted') return true;
     const owner = board.members[d.owner];
     return owner?.role === 'monitor' && owner.status !== 'killed';
-  })) return null;
-  if (!deliveries.length && posts.some(post => post.sessionId === board.rootId && post.channel === 'main' &&
-      /^\[done\](?:\s|$)/i.test(post.text) && !/@/.test(post.text))) return null;
-  return { lead, workers, posts, deliveries, outstanding };
+  });
 }
 
 // Kept as its own diagnosis: all workers parked is actionable even before a
 // configured silence timeout, but working without posts is not a parked stall.
-export function diagnoseStall(board, team = unfinishedTeam(board)) {
-  if (!team) return null;
+export function diagnoseStall(board, team = teamSnapshot(board)) {
+  if (!team || team.donePost) return null;
   const { workers, lead, posts } = team;
   if (!workers.length || !posts.length || workers.some(m => !['waiting', 'stopped', 'paused'].includes(m.status))) return null;
   const latest = posts.at(-1);
@@ -124,15 +129,16 @@ function quietAlert(board, team, silenceMs, now) {
 
 // Pure evaluation against a snapshot at a caller-supplied wall-clock instant.
 export function evaluateBoardAlerts(board, now) {
-  const team = unfinishedTeam(board);
+  const team = teamSnapshot(board);
   if (!team) return [];
   const { deadlineUtc, silenceMs } = getBoardClock(board);
+  const clockWork = hasClockWork(board, team);
   const alerts = [];
-  if (deadlineUtc && now >= Date.parse(deadlineUtc)) {
+  if (clockWork && deadlineUtc && now >= Date.parse(deadlineUtc)) {
     alerts.push({ kind: 'deadline', key: `${board.reminders.deadlineEpoch ?? 0}:${deadlineUtc}`, message:
       `[Swarm monitor] The board deadline ${deadlineUtc} has arrived. Review outstanding work; no member has been stopped.` });
   }
-  if (silenceMs) {
+  if (clockWork && silenceMs) {
     const quiet = quietAlert(board, team, silenceMs, now);
     if (quiet) alerts.push(quiet);
   }

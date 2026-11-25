@@ -11,7 +11,12 @@ function text(value, limit) {
   return value.trim() || null;
 }
 
-function validTaskId(id) {
+export function visibleDeliveries(board, member) {
+  const items = board.deliveries ?? [];
+  return member.role === 'coordinator' ? items : items.filter(d => d.owner === member.sessionId);
+}
+
+export function validTaskId(id) {
   return isSafeKey(id) && id.length <= 64 && !/[\s\u0000-\u001f\u007f]/u.test(id);
 }
 
@@ -46,22 +51,44 @@ export function assignDelivery(draft, actor, action, owner) {
   return receipt(delivery);
 }
 
+// Shared with the external mailbox. Return only the supplied reference fields;
+// callers may apply stricter path rules, but neither surface resolves or opens them.
+export function submissionRefs(version, path, commit) {
+  if (commit !== undefined) {
+    if (version !== undefined || path !== undefined || typeof commit !== 'string' || !/^[a-f0-9]{7,64}$/i.test(commit)) return null;
+    return { artifactCommit: commit };
+  }
+  const artifactPath = text(path, 512);
+  if (!artifactPath || /[\t\n\r]/u.test(path)) return null;
+  if (version === undefined) return { artifactPath };
+  const artifactVersion = text(version, 160);
+  if (!artifactVersion || /[\t\n\r]/u.test(version)) return null;
+  return { artifactVersion, artifactPath };
+}
+
+function recordedRefs({ artifactVersion, artifactPath, artifactCommit }) {
+  const refs = submissionRefs(artifactVersion, artifactPath, artifactCommit);
+  // v1 version+path receipts retain their exact original shape.
+  if (!refs || refs.artifactVersion !== undefined) return refs;
+  return { refKind: refs.artifactCommit !== undefined ? 'commit' : 'path', ...refs };
+}
+
 export function submitDelivery(draft, actor, action) {
   if (!validTaskId(action.taskId)) return reject('INVALID_ARGUMENT', 'invalid delivery taskId');
   const delivery = draft.deliveries.find((item) => item.taskId === action.taskId);
-  if (!delivery) return reject('NOT_FOUND', 'delivery task not found');
-  if (delivery.owner !== actor.sessionId) return reject('FORBIDDEN', 'delivery owner only');
+  if (actor.role === 'coordinator') return reject('FORBIDDEN', 'delivery owner only');
+  if (!delivery || delivery.owner !== actor.sessionId) return reject('NOT_FOUND', 'no such delivery in your scope');
   if (!['assigned', 'returned', 'submitted'].includes(delivery.status)) {
     return reject('INVALID_STATE', 'delivery is not open for submission');
   }
-  const artifactVersion = text(action.artifactVersion, 160);
-  const artifactPath = text(action.artifactPath, 512);
-  if (!artifactVersion || !artifactPath || /[\t\n\r]/u.test(artifactVersion + artifactPath)) {
-    return reject('INVALID_ARGUMENT', 'artifactVersion and artifactPath must be nonempty single-line references');
-  }
+  const refs = recordedRefs(action);
+  if (!refs) return reject('INVALID_ARGUMENT', 'submit a path (with optional version) or a 7–64 digit hex commit');
   const seq = (delivery.submission?.seq ?? 0) + 1;
   if (!Number.isSafeInteger(seq)) return reject('LIMIT', 'delivery submission sequence exhausted');
-  delivery.submission = { seq, artifactVersion, artifactPath };
+  // A fresh submission has no verdict. Keep the last consumed return separately
+  // so that the owner and lead can compare it with this attempt, even on v1 boards.
+  if (delivery.review?.decision === 'returned') delivery.lastReturn = delivery.review;
+  delivery.submission = { seq, ...refs };
   delivery.review = null;
   delivery.status = 'submitted';
   delivery.updatedAt = draft.clock;
@@ -78,10 +105,10 @@ export function reviewDelivery(draft, actor, action) {
   if (!Number.isSafeInteger(submittedSeq) || submittedSeq < 1) {
     return reject('INVALID_ARGUMENT', 'submittedSeq must be a positive integer');
   }
-  const { seq, artifactVersion, artifactPath } = delivery.submission;
-  if (submittedSeq !== seq ||
-      (action.artifactVersion !== undefined && action.artifactVersion !== artifactVersion) ||
-      (action.artifactPath !== undefined && action.artifactPath !== artifactPath)) {
+  const { seq, ...refs } = delivery.submission;
+  if (submittedSeq !== seq || ['artifactVersion', 'artifactPath', 'artifactCommit'].some(
+    field => action[field] !== undefined && action[field] !== refs[field],
+  )) {
     return reject('INVALID_STATE', 'review does not match the pending submission');
   }
   if (decision !== 'accepted' && decision !== 'returned') {
@@ -92,7 +119,7 @@ export function reviewDelivery(draft, actor, action) {
   }
   const evidence = text(action.evidence, 1024);
   if (!evidence) return reject('INVALID_ARGUMENT', 'manual review evidence must be nonempty bounded text');
-  delivery.review = { submittedSeq, artifactVersion, artifactPath, decision, checkPassed, evidence, reviewer: actor.sessionId };
+  delivery.review = { submittedSeq, ...refs, decision, checkPassed, evidence, reviewer: actor.sessionId };
   delivery.status = decision;
   delivery.updatedAt = draft.clock;
   return receipt(delivery);

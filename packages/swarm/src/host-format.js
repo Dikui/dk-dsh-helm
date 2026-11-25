@@ -37,6 +37,11 @@ export function oneLine(text, limit = 200) {
   return truncateText(String(text ?? '').replace(/\s+/g, ' ').trim(), limit);
 }
 
+export function contractReceipt(added) {
+  if (!added.taskId) return '';
+  return ` Delivery ${JSON.stringify(added.taskId)} assigned.${added.notified ? '' : ' Join notice not delivered; the assignment is saved.'}`;
+}
+
 export function byteLength(text) {
   return new TextEncoder().encode(String(text ?? '')).length;
 }

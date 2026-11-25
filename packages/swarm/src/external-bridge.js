@@ -7,6 +7,8 @@ import { constants as F, promises as fs } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { isValidChannelName } from './channels.js';
+import { submissionRefs, validTaskId } from './deliveries.js';
+import { requestDigest } from './external-requests.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const VIEW_BYTES = 4 * 1024 * 1024, REQUEST_BYTES = 64 * 1024, ACK_BYTES = 64 * 1024;
@@ -99,9 +101,16 @@ async function atomicJson(file, data, max) {
   const json = JSON.stringify(data);
   if (typeof json !== 'string' || Buffer.byteLength(json) > max) throw bad('OUTPUT_LIMIT');
   const temp = path.join(path.dirname(file), '.' + randomUUID() + '.tmp');
-  const handle = await fs.open(temp, 'wx', 0o644);
+  const handle = await fs.open(temp, 'wx', 0o600);
   try {
-    try { await handle.writeFile(json); await handle.sync(); } finally { await handle.close(); }
+    try {
+      await handle.writeFile(json);
+      // Share only with the dedicated seat group / inherited read ACL. Use
+      // the new fd, not the mutable inbox pathname or the global umask.
+      await handle.chmod(0o640);
+      if (((await handle.stat()).mode & 0o777) !== 0o640) throw bad('UNSUPPORTED_FILE_MODE');
+      await handle.sync();
+    } finally { await handle.close(); }
     await fs.rename(temp, file); // Never follow/open/truncate the destination.
   } catch (e) { await fs.unlink(temp).catch(() => {}); throw e; }
 }
@@ -115,12 +124,13 @@ function requestFor(id, data) {
     if (data.channel === undefined) return { id, op: 'post', text: data.text };
     if (data.channel === 'main' || isValidChannelName(data.channel)) return { id, op: 'post', text: data.text, channel: data.channel };
   }
-  if (data.op === 'submit' && only(['op', 'taskId', 'artifactVersion', 'artifactPath'])) {
-    const { taskId, artifactVersion, artifactPath } = data;
-    if (string(taskId, 128) && string(artifactVersion, 256) && string(artifactPath, 1024) &&
-        !/[\x00-\x1f\x7f]/.test(taskId + artifactVersion + artifactPath) && !/^[A-Za-z]:/.test(artifactPath) &&
-        !artifactPath.includes('\\') && artifactPath.split('/').every(p => p !== '' && p !== '.' && p !== '..')) {
-      return { id, op: 'submit', taskId, artifactVersion, artifactPath }; // Reference only; never opened.
+  if (data.op === 'submit' && only(['op', 'taskId', 'artifactVersion', 'artifactPath', 'artifactCommit', 'after'])) {
+    const { taskId, after } = data;
+    const refs = submissionRefs(data.artifactVersion, data.artifactPath, data.artifactCommit);
+    const p = refs?.artifactPath;
+    const relative = p === undefined || (!/^[A-Za-z]:/.test(p) && !p.includes('\\') && p.split('/').every(s => s && s !== '.' && s !== '..'));
+    if (validTaskId(taskId) && refs && relative && (after === undefined || (Number.isSafeInteger(after) && after >= 0))) {
+      return { id, op:'submit', taskId, ...refs, ...(after !== undefined && {after}) }; // Reference only; never opened.
     }
   }
   invalid();
@@ -143,50 +153,99 @@ export async function readMailbox(seat) {
   await checkSeat(seat, false);
   return readJson(path.join(seat, 'view.json'), VIEW_BYTES);
 }
-export async function enqueueMailbox(seat, data) {
+export async function enqueueMailbox(seat, data, id = randomUUID()) {
   await checkSeat(seat, false);
-  const id = randomUUID();
-  requestFor(id, data);
-  await atomicJson(path.join(seat, 'inbox', id + '.json'), data, REQUEST_BYTES);
+  const digest = requestDigest(requestFor(id, data));
+  const cached = (await receipts(seat)).find(a => a.id === id);
+  if (cached && cached.code !== 'ID_CONFLICT') {
+    if (cached.digest !== digest) throw bad('ID_CONFLICT');
+    return { id, queued: true }; // Already processed. Never overwrite a committed envelope.
+  }
+  const envelope = path.join(seat, 'inbox', id + '.json');
+  try {
+    const pending = requestFor(id, await readJson(envelope, REQUEST_BYTES));
+    if (requestDigest(pending) !== digest) throw bad('ID_CONFLICT');
+    return { id, queued: true };
+  } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  await atomicJson(envelope, data, REQUEST_BYTES);
   return { id, queued: true };
 }
 export async function readMailboxAck(seat, id) {
   if (!validId(id)) invalid();
   await checkSeat(seat, false);
-  return (await receipts(seat)).find(a => a.id === id) ?? { id, pending: true };
+  const ack = (await receipts(seat)).find(a => a.id === id);
+  return ack ? ackFor(id, ack) : { id, pending: true };
+}
+
+// Keep the position in the directory, not a list of untrusted filenames. A seat
+// that hits a budget can continue its pass; inactive seats hold no permanent fd.
+const idleScans = new Map();
+const MAX_ACTIVE_SCANS = 16, MAX_IDLE_SCANS = 16, SCAN_IDLE_MS = 10 * 60_000;
+function takeScan(seat) {
+  const scan = idleScans.get(seat);
+  if (!scan) return null;
+  idleScans.delete(seat);
+  clearTimeout(scan.timer);
+  return scan.dir;
+}
+function retainScan(seat, dir) {
+  const evicted = idleScans.size >= MAX_IDLE_SCANS ? takeScan(idleScans.keys().next().value) : null;
+  const timer = setTimeout(() => takeScan(seat)?.close().catch(() => {}), SCAN_IDLE_MS);
+  timer.unref();
+  idleScans.set(seat, { dir, timer });
+  return evicted;
 }
 
 export async function syncMailbox(seat, { snapshot, consume }) {
-  if (syncing.has(seat)) throw bad('MAILBOX_BUSY');
+  if (syncing.has(seat) || syncing.size >= MAX_ACTIVE_SCANS) throw bad('MAILBOX_BUSY');
   syncing.add(seat);
+  let dir = takeScan(seat);
   try {
     await checkSeat(seat, true);
     let acks = await receipts(seat), processed = 0, rejected = 0, scanned = 0;
     const inbox = path.join(seat, 'inbox');
-    const dir = await fs.opendir(inbox);
-    for await (const entry of dir) {
-      if (++scanned > SCAN || processed + rejected >= BATCH) break;
+    dir ??= await fs.opendir(inbox);
+    let atEnd = false;
+    while (scanned < SCAN && processed + rejected < BATCH) {
+      const entry = await dir.read();
+      if (!entry) { atEnd = true; break; }
+      scanned++;
       const id = entry.name.slice(0, -5);
       if (!entry.name.endsWith('.json') || !validId(id)) continue;
       const file = path.join(inbox, entry.name);
-      let ack = acks.find(a => a.id === id);
-      if (!ack) {
-        let request;
-        try { request = requestFor(id, await readJson(file, REQUEST_BYTES)); }
-        catch (e) {
-          if (e.code === 'ENOENT') continue;
-          if (!['ELOOP', 'INVALID_FILE', 'INVALID_JSON', 'INVALID_REQUEST', 'EACCES'].includes(e.code)) throw e;
-          ack = { id, ok: false, code: 'INVALID_REQUEST' };
-        }
-        if (request) ack = ackFor(id, await consume(request));
-        acks = [...acks.slice(1 - ACK_LIMIT), ack];
+      const cached = acks.find(a => a.id === id);
+      let request, ack;
+      try { request = requestFor(id, await readJson(file, REQUEST_BYTES)); }
+      catch (e) {
+        if (e.code === 'ENOENT') continue;
+        if (!['ELOOP', 'INVALID_FILE', 'INVALID_JSON', 'INVALID_REQUEST'].includes(e.code)) throw e;
+        ack = cached?.code === 'INVALID_REQUEST' ? cached : { id, ok:false, code:'INVALID_REQUEST' };
+      }
+      if (request) {
+        const digest = requestDigest(request);
+        if (cached?.digest === digest) ack = cached;
+        else if (cached?.digest && cached.code !== 'ID_CONFLICT') ack = {id, ok:false, code:'ID_CONFLICT', digest};
+        else ack = { ...ackFor(id, await consume(request)), digest }; // Durable board resolves cache misses, including original after conflict.
+      }
+      if (ack !== cached) {
+        acks = [...acks.filter(a => a.id !== id).slice(1 - ACK_LIMIT), ack];
         await atomicJson(path.join(seat, 'acks.json'), acks, ACK_BYTES);
       }
       // An unexpected directory is not a file to be recursively deleted.
-      await fs.unlink(file).catch(e => { if (!['ENOENT', 'EISDIR', 'EPERM'].includes(e.code)) throw e; });
+      try { await fs.unlink(file); }
+      catch (e) {
+        // Some POSIX hosts report EPERM, not EISDIR, for unlink(directory).
+        if (e.code === 'EPERM') {
+          const stat = await fs.lstat(file).catch(err => { if (err.code !== 'ENOENT') throw err; });
+          if (stat && !stat.isDirectory()) throw e;
+        } else if (!['ENOENT', 'EISDIR'].includes(e.code)) throw e;
+      }
       if (ack.ok) processed++; else rejected++;
     }
     await atomicJson(path.join(seat, 'view.json'), await snapshot(), VIEW_BYTES);
+    if (!atEnd) dir = retainScan(seat, dir); // finally closes an evicted cursor, if any.
     return { processed, rejected };
-  } finally { syncing.delete(seat); }
+  } finally {
+    try { await dir?.close(); } finally { syncing.delete(seat); }
+  }
 }

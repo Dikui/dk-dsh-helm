@@ -960,7 +960,7 @@ export class SwarmHost {
   }
 
   async addMember({
-    rootAgent, name, prompt, role = 'worker', channels, wakeMode, modelRoute, fallbackRoute,
+    rootAgent, name, prompt, contract, role = 'worker', channels, wakeMode, modelRoute, fallbackRoute,
     workspaceMode = 'share', signal, timeoutMs = SPAWN_TIMEOUT_MS,
   }) {
     const entry = this.ensureRoot(rootAgent);
@@ -1019,6 +1019,7 @@ export class SwarmHost {
 
       const reserved = await this.state.act(rootId, rootId, {
         type: 'reserveJoin',
+        ...(contract !== undefined ? { contract } : {}),
         member: {
           sessionId,
           name: cleanName,
@@ -1049,6 +1050,7 @@ export class SwarmHost {
           role,
           rootName: entry.self?.name ?? 'lead',
           prompt: text,
+          contract: reserved.result.reservation.contract,
           cwd, workspaceMode,
         });
         activation = await this.ctx.subagents.startActivation({
@@ -1072,6 +1074,7 @@ export class SwarmHost {
         // still reject its result, and that must not become unhandled.
         if (typeof activation.result?.catch === 'function') activation.result.catch(() => {});
         if (guard.cancelled) throw this.cancelledAdd(guard);
+        if (contract) controller.signal.throwIfAborted(); // A provider may return a child after cancellation.
       } catch (error) {
         clearSpawn();
         await disposeSpawn();
@@ -1123,7 +1126,23 @@ export class SwarmHost {
           ),
         );
       }
-      return { member: committed.result.member, sessionId, handle: activation };
+      const added = { member: committed.result.member, sessionId, handle: activation };
+      const delivery = committed.result.delivery;
+      if (delivery) {
+        // startActivation already sent the first turn; no public suspended-child API.
+        // A fast child may have finished without tools. Only message the real owner
+        // after commit, and never roll back a durable assignment for a failed notice.
+        const text = `[Swarm] You are now registered for delivery ${JSON.stringify(delivery.taskId)}. Check its status with swarm_delivery list and submit the artifact when ready, unless already submitted. Do not restart the task.`;
+        let notified = false;
+        try {
+          await this.sendMember(rootAgent, sessionId, [{ type: 'text', text }], { signal: guard.controller.signal });
+          notified = true;
+        } catch (error) {
+          this.log('warn', `delivery notification for ${cleanName} failed`, error);
+        }
+        return { ...added, taskId: delivery.taskId, notified };
+      }
+      return added;
     } catch (error) {
       if (checkout && !joined) {
         try {
@@ -1141,9 +1160,15 @@ export class SwarmHost {
     }
   }
 
-  buildChildPrompt({ name, role, rootName, prompt, cwd, workspaceMode }) {
+  buildChildPrompt({ name, role, rootName, prompt, contract, cwd, workspaceMode }) {
     const lines = [
       `You are "${name}", a ${role} in the Swarm led by "${rootName}".`,
+      ...(contract ? [
+        `Delivery contract: ${contract.taskId}`,
+        `Deliverable: ${contract.deliverable}`,
+        `Acceptance criterion: ${contract.criterion}`,
+        'Use this criterion from the first turn. Submit with swarm_delivery after the lead registers you; do not submit under any other identity.',
+      ] : []),
       workspaceMode === 'branch'
         ? `Workspace: ${cwd} (your isolated Git checkout). Make and test your changes here, commit the delivery, and post the commit for the lead to review. Never merge into the lead checkout yourself.`
         : `Workspace: ${cwd ?? 'inherit the lead session working directory'} (shared with the lead; do not create worktrees unless the lead explicitly asks).`,
@@ -1155,7 +1180,7 @@ export class SwarmHost {
       '- Use read_board to read new posts; your first read advances your cursor.',
       '- Use post_message to report status, blockers and results to the lead. Mention people by name (for example @lead).',
       '- Use swarm_wait when you are waiting for a reply or for more work. It parks this turn; a mention will wake you.',
-      '- If assigned a delivery contract, inspect it with swarm_delivery list, then submit the exact artifact path and version. A [done] post is not acceptance.',
+      '- For a delivery contract, inspect it with swarm_delivery list. Submit the artifact path (with a version if available) or a Git commit. A [done] post is not acceptance.',
       '- Use the swarm tool only for coordinator actions; you are a member.',
       `- If read_board/post_message/swarm are not visible yet, the lead is finalizing your membership; continue the task and retry shortly.`,
       '- Do not spawn subagents, do not change the shared board state outside the tools, and do not ask for the lead\'s session id.',

@@ -1,4 +1,4 @@
-import { asHostError, failure, oneLine, parseSwarmInput, splitWords, truncateText } from './host-format.js';
+import { asHostError, contractReceipt, failure, oneLine, parseSwarmInput, splitWords, truncateText } from './host-format.js';
 import { parseAlert } from './quota-watch.js';
 import { formatStatus } from './host-tools.js';
 
@@ -11,6 +11,7 @@ const USAGE = [
   '/swarm add <name> [flags] <task>    Spawn a teammate (alias: start)',
   '  flags: --role worker|monitor  --channel <name>  --wake mentions|anything',
   '         --worktree  --model <provider/model>  --fallback <provider/model>  -- <literal task>',
+  '         --contract <taskId> "<deliverable>" "<criterion>" -- <task>  (optional first-turn acceptance contract)',
   '/swarm merge <name>                 Fast-forward the lead checkout from a finished member',
   '/swarm status                       Board, member and plan summary',
   ...coordinationHelp,
@@ -36,6 +37,18 @@ function readAddArgs(words) {
     tail = copy.splice(dart + 1);
     copy.splice(dart, 1);
   }
+  let contract;
+  const index = copy.indexOf('--contract');
+  if (index !== -1) {
+    const usage = '--contract requires <taskId> "<deliverable>" "<criterion>" -- <task>';
+    const values = copy.slice(index + 1, index + 4);
+    if (dart < 0 || values.length !== 3 || values.some(value => !value.trim() || value.startsWith('--')) || copy.lastIndexOf('--contract') !== index) {
+      throw failure('INVALID_ARGUMENT', usage);
+    }
+    const [taskId, deliverable, criterion] = values;
+    contract = { taskId, deliverable, criterion };
+    copy.splice(index, 4);
+  }
   const modelRoute = takeRoute(copy, '--model');
   const fallbackRoute = takeRoute(copy, '--fallback');
   const branchIndex = copy.indexOf('--worktree');
@@ -44,8 +57,9 @@ function readAddArgs(words) {
   const channel = take(copy, '--channel');
   const wakeMode = take(copy, '--wake');
   const name = copy.shift();
+  if (contract && copy.length) throw failure('INVALID_ARGUMENT', 'put the contracted task after --; quote multi-word contract values');
   const rest = [...copy, ...tail].join(' ').trim();
-  return { name, prompt: rest, role, channel, wakeMode, modelRoute, fallbackRoute, workspaceMode: branchIndex === -1 ? undefined : 'branch' };
+  return { name, prompt: rest, role, channel, wakeMode, modelRoute, fallbackRoute, ...(contract ? { contract } : {}), workspaceMode: branchIndex === -1 ? undefined : 'branch' };
 }
 
 function takeRoute(words, flag) {
@@ -147,7 +161,7 @@ export function registerSwarmCommands(host) {
             });
             return {
               kind: 'success',
-              text: `Added ${added.member.name} (${added.member.role}). Workspace: ${added.member.worktreePath ?? 'shared with the lead'}.`,
+              text: `Added ${added.member.name} (${added.member.role}). Workspace: ${added.member.worktreePath ?? 'shared with the lead'}.${contractReceipt(added)}`,
             };
           }
           case 'quota': {

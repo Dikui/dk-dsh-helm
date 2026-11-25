@@ -27,7 +27,7 @@ import {
   parseMentions,
   resolveMentions,
 } from './channels.js';
-import { assignDelivery, submitDelivery, reviewDelivery } from './deliveries.js';
+import { assignDelivery, submitDelivery, reviewDelivery, visibleDeliveries } from './deliveries.js';
 
 import { configureBoardClock, ackBoardAlert } from './board-clock.js';
 import { externalRequest } from './external-requests.js';
@@ -571,6 +571,22 @@ function actionBootstrap(draft, actor, action, now) {
   return ok({ member: memberView(draft, member) });
 }
 
+// Validate using the same policy as manual assignment, without publishing a
+// delivery or granting the reserved identity any board access.
+function prepareAssignment(draft, actor, action, owner) {
+  const deliveries = [...draft.deliveries];
+  for (const reservation of Object.values(draft.reservations)) {
+    if (reservation.contract) deliveries.push(reservation.contract); // claims its ID and one slot
+  }
+  return assignDelivery({ clock: draft.clock, deliveries }, actor, action, owner);
+}
+
+function assignAvailableDelivery(draft, actor, action, owner) {
+  const prepared = prepareAssignment(draft, actor, action, owner);
+  if (prepared.result?.ok) draft.deliveries.push(clone(prepared.result.delivery));
+  return prepared;
+}
+
 function addMember(draft, actor, action, now, { reserve = false } = {}) {
   const specResult = readSpec(actor, draft, action.member, { reserve });
   if (specResult.error) return specResult.error;
@@ -587,6 +603,14 @@ function addMember(draft, actor, action, now, { reserve = false } = {}) {
   if (memberCount(draft) >= draft.limits.maxMembers) {
     return fail(ERRORS.LIMIT, `member limit ${draft.limits.maxMembers} reached`);
   }
+  let contract;
+  if (action.contract !== undefined) {
+    if (!reserve || !isPlainObject(action.contract)) return fail(ERRORS.INVALID_ARGUMENT, 'a native add contract must be a reservation object');
+    const prepared = prepareAssignment(draft, actor, action.contract, spec);
+    if (!prepared.result?.ok) return prepared;
+    const { taskId, deliverable, criterion } = prepared.result.delivery;
+    contract = { taskId, deliverable, criterion };
+  }
   if (reserve) {
     draft.counters.reservation += 1;
     let id = `res-${draft.counters.reservation}`;
@@ -597,6 +621,7 @@ function addMember(draft, actor, action, now, { reserve = false } = {}) {
     const reservation = {
       id,
       ...spec,
+      ...(contract ? { contract } : {}),
       reservedBy: actor.sessionId,
       reservedAtSeq: draft.seq,
       at: now,
@@ -613,6 +638,7 @@ function addMember(draft, actor, action, now, { reserve = false } = {}) {
         channels: reservation.channels.slice(),
         reservedBy: reservation.reservedBy,
         reservedAtSeq: reservation.reservedAtSeq,
+        ...(contract ? { contract: { ...contract } } : {}),
       },
       member: {
         sessionId: spec.sessionId,
@@ -634,6 +660,9 @@ function commitJoin(draft, actor, action, now) {
   const reservation = draft.reservations[id];
   if (actor.sessionId !== reservation.sessionId && actor.role !== 'coordinator') {
     return fail(ERRORS.FORBIDDEN, 'only the reserved session or coordinator may commit');
+  }
+  if (reservation.contract && actor.role !== 'coordinator') {
+    return fail(ERRORS.FORBIDDEN, 'only the coordinator may commit a contracted join');
   }
   if (hasOwn(draft.members, reservation.sessionId)) {
     return fail(ERRORS.DUPLICATE_SESSION, 'session is already a member');
@@ -664,6 +693,11 @@ function commitJoin(draft, actor, action, now) {
     member.worktreeId = checkout.id;
     member.worktreePath = checkout.path;
   }
+  if (reservation.contract) {
+    const assigned = assignAvailableDelivery(draft, actor, reservation.contract, member);
+    if (!assigned.result?.ok) return assigned; // transition discards the whole draft
+    return ok({ member: memberView(draft, member), delivery: assigned.result.delivery });
+  }
   return ok({ member: memberView(draft, member) });
 }
 
@@ -675,6 +709,9 @@ function failJoin(draft, actor, action) {
   const reservation = draft.reservations[id];
   if (actor.sessionId !== reservation.sessionId && actor.role !== 'coordinator') {
     return fail(ERRORS.FORBIDDEN, 'only the reserved session or coordinator may fail a join');
+  }
+  if (reservation.contract && actor.role !== 'coordinator') {
+    return fail(ERRORS.FORBIDDEN, 'only the coordinator may revoke a contracted join');
   }
   delete draft.reservations[id];
   return ok({ reservationId: id, failed: true, reason: action.reason ?? null });
@@ -1141,7 +1178,7 @@ function statusOf(draft, actor) {
   return ok({
     title: draft.title,
     plan: clone(draft.plan),
-    deliveries: clone(actor.role === 'coordinator' ? draft.deliveries : draft.deliveries.filter(d => d.owner === actor.sessionId)),
+    deliveries: clone(visibleDeliveries(draft, actor)),
     seq: draft.seq,
     headSeq: draft.seq,
     members,
@@ -1715,7 +1752,7 @@ export function transition(board, actorSessionId, action) {
       break;
     }
     case 'assignDelivery': {
-      outcome = requireActor() ?? assignDelivery(draft, actor, action, memberBySession(draft, action.owner));
+      outcome = requireActor() ?? assignAvailableDelivery(draft, actor, action, memberBySession(draft, action.owner));
       break;
     }
     case 'submitDelivery': {
