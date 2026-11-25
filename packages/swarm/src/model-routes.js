@@ -51,7 +51,7 @@ export function normalizeModelRoute(value, label = 'model route') {
 
 /** Stable identity of one exact route. */
 export function routeKey(route) {
-  return route ? `${route.provider}\u0000${route.model}` : ''
+  return route ? JSON.stringify([route.provider, route.model]) : ''
 }
 
 /** Whether two routes are the same provider and model. */
