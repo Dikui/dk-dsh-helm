@@ -127,7 +127,7 @@ test('installed runtime: /swarm command, four-tool gating, wake delivery and dur
     const kickoff = postedSeq(await command(root, '/swarm post Kickoff for the team'));
     assert.equal((await command(root, '/swarm add worker-1 do the task')).kind, 'success');
     releaseGate();
-    assert.deepEqual(await toolNames(root), ['post_message', 'read_board', 'swarm', 'swarm_wait']);
+    assert.deepEqual(await toolNames(root), ['post_message', 'read_board', 'swarm', 'swarm_delivery', 'swarm_wait']);
     await parked;
     assert.equal((await invoke(root, 'read_board', {})).value.lastReadSeq, kickoff);
     assert.equal((await invoke(root, 'swarm_wait', {})).value.waiting, true);

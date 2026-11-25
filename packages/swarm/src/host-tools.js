@@ -1,6 +1,8 @@
 import { READ_RENDER_LIMIT } from './board.js';
 import { asHostError, byteLength, failure, isPlainObject, truncateText } from './host-format.js';
 
+import { changeDelivery, listDeliveries } from './host-deliveries.js';
+
 const OUTPUT = {
   type: 'object',
   properties: { ok: { type: 'boolean' } },
@@ -254,6 +256,28 @@ export function registerSwarmTools(host) {
     },
     (context) => host.canUseSwarmTool(context.agent),
   );
+
+  register({
+    name: 'swarm_delivery',
+    description: 'Optional delivery contracts. list (taskId for full details, offset for next page); the lead assigns to a member by name and reviews its exact submittedSeq after checking the artifact. Only the owner submits its version and path. A done post is not acceptance.',
+    parameters: schema({
+      action: { type:'string', enum:['list','assign','submit','review'] },
+      taskId:{type:'string'}, offset:{type:'integer',minimum:0}, owner:{type:'string'}, deliverable:{type:'string'}, criterion:{type:'string'},
+      artifactVersion:{type:'string'}, artifactPath:{type:'string'}, submittedSeq:{type:'integer',minimum:1},
+      decision:{type:'string',enum:['accepted','returned']}, checkPassed:{type:'boolean'}, evidence:{type:'string'},
+    }, ['action']),
+    output:{schema:OUTPUT, render:(_args, value) => jsonExact(value)}, isConcurrencySafe:false,
+    async execute(args, exec) {
+      try {
+        const entry = host.ensureMember(exec.agent);
+        if (args.action === 'list') return listDeliveries(entry, args);
+        return await changeDelivery(host, entry, args.action, args);
+      } catch (error) { return toolError(error); }
+    },
+  }, ({agent}) => {
+    const e = host.state.resolve(agent);
+    return Boolean(e?.self && !['paused','killed'].includes(e.status) && (e.isRoot ? (Object.keys(e.board.members).length > 1) : e.board.deliveries?.some(d => d.owner === agent.id)));
+  });
 
   register(
     {

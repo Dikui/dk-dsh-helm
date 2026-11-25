@@ -146,7 +146,11 @@ export class SwarmHost {
     if (typeof startStallMonitor === 'function') {
       const disposer = startStallMonitor({
         list: () => this.state.roots().map((root) => this.state.board(root)).filter(Boolean),
-        notify: (rootId, message) => this.steerRoot(rootId, message, 'Swarm stall monitor'),
+        notify: (rootId, message) => this.steerRoot(rootId, message, 'Swarm board reminder'),
+        ack: async (rootId, alert) => {
+          const {result} = await this.state.act(rootId, rootId, {type:'ackBoardAlert', alert});
+          if (!result.ok) throw failure(result.code, result.message);
+        },
         onError: (error) => this.log('warn', 'stall monitor', error),
       });
       if (typeof disposer === 'function') this.off.push(disposer);
@@ -1151,6 +1155,7 @@ export class SwarmHost {
       '- Use read_board to read new posts; your first read advances your cursor.',
       '- Use post_message to report status, blockers and results to the lead. Mention people by name (for example @lead).',
       '- Use swarm_wait when you are waiting for a reply or for more work. It parks this turn; a mention will wake you.',
+      '- If assigned a delivery contract, inspect it with swarm_delivery list, then submit the exact artifact path and version. A [done] post is not acceptance.',
       '- Use the swarm tool only for coordinator actions; you are a member.',
       `- If read_board/post_message/swarm are not visible yet, the lead is finalizing your membership; continue the task and retry shortly.`,
       '- Do not spawn subagents, do not change the shared board state outside the tools, and do not ask for the lead\'s session id.',
@@ -1213,6 +1218,7 @@ export class SwarmHost {
     }
     const out = await this.state.act(rootId, rootId, { type, target: member.sessionId });
     if (!out.result?.ok) throw new HostError(out.result?.code ?? 'MANAGE_FAILED', out.result?.message ?? `${type} failed`);
+    if (member.externalMailbox) return out.result.member; // Revocation is enforced at sync/consume. There is no native process to interrupt.
     if (type === 'kill' || type === 'pause') {
       this.clearSwitch(member.sessionId);
       const handle = this.handles.get(member.sessionId);

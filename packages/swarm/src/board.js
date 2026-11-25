@@ -28,6 +28,9 @@ import {
   resolveMentions,
 } from './channels.js';
 
+import { configureBoardClock, ackBoardAlert } from './board-clock.js';
+import { externalRequest } from './external-requests.js';
+
 export const VERSION = 1;
 
 export const ERRORS = Object.freeze({
@@ -368,7 +371,7 @@ export function resolveTargets(board, post) {
 }
 
 function makePending(draft, member, seq, reason, now, force = false) {
-  if (!member || member.status === 'killed') return false;
+  if (!member || member.status === 'killed' || member.externalMailbox) return false;
   if (!force && seq <= member.lastReadSeq) return false;
   let pending = draft.pendingWakes.find((item) => item.sessionId === member.sessionId);
   if (pending) {
@@ -865,6 +868,7 @@ function resumeMember(draft, actor, action, now) {
   target.status = target.pausedFromStatus === 'waiting' || target.pausedFromStatus === 'stopped'
     ? target.pausedFromStatus
     : 'stopped';
+  if (target.externalMailbox) target.status = 'active';
   target.pausedFromStatus = null;
   target.quotaPausedAtSeq = null;
   target.updatedAtSeq = now;
@@ -1422,7 +1426,7 @@ function reconcile(draft, actor, action, now) {
       member.status = 'stopped';
       fixes.push(`member ${id} had invalid status`);
     }
-    if (live && !live.has(id) && member.status !== 'killed' && member.status !== 'paused') {
+    if (live && !live.has(id) && !member.externalMailbox && member.status !== 'killed' && member.status !== 'paused') {
       if (member.status !== 'stopped') {
         member.status = 'stopped';
         fixes.push(`member ${id} marked stopped`);
@@ -1728,6 +1732,31 @@ export function transition(board, actorSessionId, action) {
       const denied = requireActor();
       if (denied) outcome = denied;
       else outcome = setModel(draft, actor, action, now);
+      break;
+    }
+    case 'setBoardClock':
+    case 'ackBoardAlert': {
+      if (actor?.role !== 'coordinator') outcome = fail(ERRORS.FORBIDDEN, 'coordinator only');
+      else {
+        const res = action.type === 'setBoardClock' ? configureBoardClock(draft, action.patch, now) : ackBoardAlert(draft, action.alert, now);
+        outcome = res.ok ? ok(res) : res;
+      }
+      break;
+    }
+    case 'addExternal': {
+      if (actor?.role !== 'coordinator') outcome = fail(ERRORS.FORBIDDEN, 'coordinator only');
+      else if (typeof action.mailbox !== 'string' || !action.mailbox.startsWith('/') || action.mailbox.length > 4096) outcome = fail(ERRORS.INVALID_ARGUMENT, 'invalid mailbox');
+      else {
+        outcome = addMember(draft, actor, {member:{sessionId:action.sessionId, name:action.name, role:'worker'}}, now);
+        if (outcome.result?.ok) {
+          draft.members[action.sessionId].externalMailbox = action.mailbox;
+          draft.members[action.sessionId].externalReceipts = {};
+        }
+      }
+      break;
+    }
+    case 'externalRequest': {
+      outcome = requireActor() ?? externalRequest(draft, actor, action.request, now, transition);
       break;
     }
     case 'setQuotaWatch': {

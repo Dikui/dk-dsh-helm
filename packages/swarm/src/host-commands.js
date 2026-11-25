@@ -2,6 +2,8 @@ import { asHostError, failure, oneLine, parseSwarmInput, splitWords, truncateTex
 import { parseAlert } from './quota-watch.js';
 import { formatStatus } from './host-tools.js';
 
+import { coordinationCommand, coordinationHelp } from './coordination-commands.js';
+
 const USAGE = [
   'Swarm — a shared board for a lead session and native teammates.',
   '',
@@ -11,6 +13,7 @@ const USAGE = [
   '         --worktree  --model <provider/model>  --fallback <provider/model>  -- <literal task>',
   '/swarm merge <name>                 Fast-forward the lead checkout from a finished member',
   '/swarm status                       Board, member and plan summary',
+  ...coordinationHelp,
   '/swarm quota [watch <CNY|USD> <amount> | off]   First-party DeepSeek wallet and optional low-balance alert (root)',
   '/swarm goal <text>                  Set/replace the plan goal',
   '/swarm post <text>                  Post as yourself',
@@ -109,6 +112,8 @@ export function registerSwarmCommands(host) {
           throw failure('NOT_MEMBER', 'no swarm here; run /swarm init on a root session first');
         }
 
+        const coordination = await coordinationCommand(host, invocation, verb, words);
+        if (coordination) return coordination;
         switch (verb) {
           case 'status': {
             if (!entry.isRoot) throw failure('FORBIDDEN', 'only the swarm root can read /swarm status; members use read_board');

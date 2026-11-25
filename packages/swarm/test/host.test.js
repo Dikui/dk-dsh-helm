@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { randomUUID } from 'node:crypto';
+import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { readMailbox, enqueueMailbox, readMailboxAck } from '../src/external-bridge.js';
 
 import * as boardApi from '../src/board.js';
 import { BoardState, boardKey } from '../src/host-state.js';
@@ -507,14 +511,106 @@ test('request-error stops retrying after the quota pause threshold', async (t) =
   assert.equal(calls, 4);
 });
 
-test('registers four gated tools and shows social tools only after a worker joins', async (t) => {
+// Herd parity: the contract is separate from ordinary posts and applies to its owner only.
+test('lead can verify a numbered member submission without treating a done post as acceptance', async (t) => {
+  const rt = await setup();
+  t.after(() => rt.host.close());
+  registerSwarmTools(rt.host);
+  registerSwarmCommands(rt.host);
+  const alice = (await addAlice(rt)).member;
+  const command = (agent, rawInput) => rt.commands[0].handler({agent, rawInput});
+  const assign = await command(rt.root, 'assign spec alice "report file" "includes error cases"');
+  assert.equal(assign.kind, 'success', assign.text);
+  const deliver = rt.tools.find(x => x.definition.name === 'swarm_delivery');
+  const agent = rt.agents.get(alice.sessionId);
+  assert.equal(deliver.opts.when({agent}), true);
+  const tasks = await deliver.definition.execute({action:'list'}, {agent});
+  assert.equal(tasks.items[0].taskId, 'spec');
+  const submitted = await deliver.definition.execute({action:'submit', taskId:'spec', artifactVersion:'v1', artifactPath:'docs/report.md'}, {agent});
+  assert.equal(submitted.delivery.status, 'submitted');
+  const no = await command(agent, 'review spec 1 accepted passed forged');
+  assert.equal(no.kind, 'error');
+  const yes = await command(rt.root, `review spec ${submitted.delivery.submission.seq} accepted passed "read the three failure cases in v1"`);
+  assert.equal(yes.kind, 'success', yes.text);
+  assert.equal(rt.state.board('root').deliveries[0].status, 'accepted');
+});
+
+test('external seat exchanges scoped snapshots, durable receipts and versioned submissions without spawning a child', {skip:process.platform === 'win32'}, async t => {
+  const rt = await setup();
+  const base = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-host-seat-')));
+  t.after(async () => { await rt.host.close(); await rm(base, {recursive:true, force:true}); });
+  registerSwarmCommands(rt.host);
+  const run = async rawInput => {
+    const reply = await rt.commands[0].handler({agent:rt.root, rawInput});
+    assert.equal(reply.kind, 'success', reply.text);
+    return reply.text;
+  };
+  const {mailbox} = JSON.parse(await run(`external add remote "${base}"`));
+  assert.equal(rt.spawns.length, 0);
+  await run('channel create private');
+  await rt.host.post('root','root','not shared with external','private');
+  await run('post hello remote');
+  await run('assign report remote "report" "includes sources"');
+  await run('external sync remote');
+  const view = await readMailbox(mailbox);
+  assert.deepEqual(view.messages.map(m => [m.author,m.text]), [['lead','hello remote']]);
+  assert.deepEqual(view.deliveries.map(d => [d.owner,d.status]), [['remote','assigned']]);
+  assert.ok(!JSON.stringify(view).includes('seat-'));
+  const message = {op:'post',text:'hello from external'};
+  const {id} = await enqueueMailbox(mailbox,message);
+  await enqueueMailbox(mailbox,{op:'submit',taskId:'report',artifactVersion:'rev-a',artifactPath:'report.md'});
+  await run('external sync remote');
+  assert.equal((await readMailboxAck(mailbox,id)).ok,true);
+  // Replay across a lost disk acknowledgement: the board is the receipt authority.
+  await writeFile(path.join(mailbox,'acks.json'),'[]');
+  await writeFile(path.join(mailbox,'inbox',id+'.json'),JSON.stringify(message));
+  await run('external sync remote');
+  assert.equal(rt.state.board('root').posts.filter(p => p.text === message.text).length,1);
+  await run('review report 1 accepted passed "read sources at rev-a"');
+  await run('reconcile');
+  assert.equal(rt.state.memberByName('root','remote').status,'active');
+  await run('pause remote');
+  assert.equal((await rt.commands[0].handler({agent:rt.root,rawInput:'external sync remote'})).kind,'error');
+  await run('resume remote');
+  await run('external sync remote');
+  assert.equal((await readMailbox(mailbox)).deliveries[0].status,'accepted');
+  await run('finish');
+  assert.equal((await rt.commands[0].handler({agent:rt.root,rawInput:'external sync remote'})).kind,'error');
+  assert.equal(rt.sends.length,0);
+});
+
+test('only the lead may configure clocks or explicitly confirm a paid probe', async t => {
+  const rt = await setup(); t.after(() => rt.host.close());
+  registerSwarmCommands(rt.host);
+  const run = (agent, rawInput) => rt.commands[0].handler({agent,rawInput});
+  const alice = (await addAlice(rt)).member, worker = rt.agents.get(alice.sessionId);
+  assert.deepEqual(JSON.parse((await run(rt.root,'clock')).text),{deadlineUtc:null,silenceMs:null});
+  assert.equal((await run(worker,'clock silence 1')).kind,'error');
+  const clock = await run(rt.root,'clock silence 2');
+  assert.equal(clock.kind,'success',clock.text);
+  assert.equal(JSON.parse(clock.text).silenceMs,120000);
+  assert.equal((await run(rt.root,'clock deadline 2030-02-30T00:00Z')).kind,'error');
+  assert.equal(JSON.parse((await run(rt.root,'clock off')).text).silenceMs,null);
+  let dispatched = 0;
+  rt.root.session.snapshotEvents = () => [];
+  rt.root.session.requestHeader = () => ({config:{provider:'p',model:'m'}});
+  rt.ctx.llm = {prepareCall:async () => {dispatched++;return {config:{},stream:async function*(){yield {type:'finish',reason:{kind:'stop'}};}}}};
+  assert.equal((await run(rt.root,'probe p/m')).kind,'error');
+  assert.equal((await run(worker,'probe p/m --confirm-paid')).kind,'error');
+  assert.equal(dispatched,0);
+  const probe = await run(rt.root,'probe p/m --confirm-paid');
+  assert.equal(probe.kind,'success',probe.text);
+  assert.equal(dispatched,1);
+});
+
+test('registers gated tools and shows social tools only after a worker joins', async (t) => {
   const rt = await setup();
   t.after(() => rt.host.close());
   registerSwarmTools(rt.host);
 
   assert.deepEqual(
     rt.tools.map((entry) => entry.definition.name).sort(),
-    ['post_message', 'read_board', 'swarm', 'swarm_wait'],
+    ['post_message', 'read_board', 'swarm', 'swarm_delivery', 'swarm_wait'],
   );
   const byName = Object.fromEntries(rt.tools.map((entry) => [entry.definition.name, entry]));
   assert.equal(byName.swarm.opts.when({ agent: rt.root }), true);
