@@ -1,5 +1,5 @@
 {
-  "name":"@local/dk-dsh-teamwork", "version":"0.0.4", "private":true,
+  "name":"@local/dk-dsh-teamwork", "version":"0.0.5", "private":true,
   "description":"A specification-gated, independently audited team campaign for DeepSeek Harness.",
   "type":"module", "license":"UNLICENSED", "engines":{"dsh":"0.2.2-rc.5"},
   "main":"./index.js", "icon":"./icon.svg",
