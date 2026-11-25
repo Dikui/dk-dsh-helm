@@ -27,6 +27,7 @@ import {
   parseMentions,
   resolveMentions,
 } from './channels.js';
+import { assignDelivery, submitDelivery, reviewDelivery } from './deliveries.js';
 
 import { configureBoardClock, ackBoardAlert } from './board-clock.js';
 import { externalRequest } from './external-requests.js';
@@ -1140,6 +1141,7 @@ function statusOf(draft, actor) {
   return ok({
     title: draft.title,
     plan: clone(draft.plan),
+    deliveries: clone(draft.deliveries),
     seq: draft.seq,
     headSeq: draft.seq,
     members,
@@ -1577,6 +1579,7 @@ export function newBoard(rootId, title = 'Swarm', options = {}) {
     channels: emptyChannels(),
     posts: [],
     plan: emptyPlan(),
+    deliveries: [],
     pendingWakes: [],
     counters: { reservation: 0 },
     limits,
@@ -1631,6 +1634,7 @@ export function transition(board, actorSessionId, action) {
     };
   }
   const draft = clone(board);
+  draft.deliveries ??= []; // Boards persisted before member delivery acceptance.
   draft.clock = Math.max(draft.clock ?? 0, now);
   draft.updatedAt = draft.clock;
   const actorId = actorSessionId ?? null;
@@ -1708,6 +1712,18 @@ export function transition(board, actorSessionId, action) {
       const denied = requireActor();
       if (denied) outcome = denied;
       else outcome = setTitle(draft, actor, action);
+      break;
+    }
+    case 'assignDelivery': {
+      outcome = requireActor() ?? assignDelivery(draft, actor, action, memberBySession(draft, action.owner));
+      break;
+    }
+    case 'submitDelivery': {
+      outcome = requireActor() ?? submitDelivery(draft, actor, action);
+      break;
+    }
+    case 'reviewDelivery': {
+      outcome = requireActor() ?? reviewDelivery(draft, actor, action);
       break;
     }
     case 'setPlan': {
@@ -1867,6 +1883,7 @@ export function boardView(board, options = {}) {
     createdAt: board.createdAt,
     updatedAt: board.updatedAt,
     plan: clone(board.plan),
+    deliveries: clone(board.deliveries ?? []),
     members: allMembers.slice(0, memberLimit).map((member) => memberView(board, member)),
     channels: Object.keys(board.channels).map((name) => channelView(board, board.channels[name], null)),
     reservations: Object.keys(board.reservations).map((id) => {
