@@ -1397,3 +1397,46 @@ test('a local message factory matches the dsh UserMessage data shape', () => {
   assert.equal(typeof message.id, 'string');
   assert.equal(formatStatus({ title: 'x', seq: 0, plan: null, counts: { members: 1, active: 0 }, members: [], messages: [] }), 'Swarm "x" — seq 0\nMembers: 1 (0 active workers)');
 });
+
+test('the session switch lazily creates a board and gates only the root', async (t) => {
+  const rt = makeRuntime();
+  await rt.host.start();
+  t.after(() => rt.host.close());
+  assert.deepEqual(rt.host.mode('root'), { root: true, exists: false, enabled: false, title: null });
+  assert.deepEqual(await rt.host.setEnabled('root', false), { created: false, enabled: false, title: null });
+  assert.equal(rt.state.board('root'), null);
+
+  const on = await rt.host.setEnabled('root', true);
+  assert.equal(on.created, true);
+  assert.equal(on.enabled, true);
+  assert.equal(rt.state.board('root').enabled, true);
+  assert.deepEqual(rt.host.mode('root'), { root: true, exists: true, enabled: true, title: 'Swarm' });
+
+  const alice = await addAlice(rt);
+  const child = rt.agents.get(alice.sessionId);
+  assert.deepEqual(rt.host.mode(alice.sessionId), { root: false, exists: false, enabled: false, title: null });
+  assert.equal(rt.host.canUseSwarmTool(rt.root), true);
+  assert.equal(rt.host.canUseSocialTool(rt.root), true);
+  assert.equal(rt.host.canUseSocialTool(child), true);
+
+  const off = await rt.host.setEnabled('root', false);
+  assert.deepEqual(off, { created: false, enabled: false, title: 'Swarm' });
+  assert.equal(rt.state.board('root').enabled, false);
+  assert.equal(rt.host.canUseSwarmTool(rt.root), false);
+  assert.equal(rt.host.canUseSocialTool(rt.root), false);
+  assert.equal(rt.host.canUseSocialTool(child), true, 'members keep their social tools while the root is off');
+  assert.equal(rt.host.unreadActivity(rt.state.resolve(rt.root)), null);
+  const steers = rt.root.steers.length;
+  assert.equal(await rt.host.steerRoot('root', 'off', 'off'), false);
+  assert.equal(rt.root.steers.length, steers);
+  await assert.rejects(async () => rt.host.ensureRoot(rt.root), { code: 'CLOSED' });
+  await assert.rejects(async () => rt.host.ensureMember(rt.root), { code: 'CLOSED' });
+  assert.equal(rt.host.ensureMember(child).isRoot, false);
+
+  const back = await rt.host.setEnabled('root', true);
+  assert.equal(back.enabled, true);
+  assert.equal(rt.state.board('root').enabled, true);
+  assert.equal(rt.host.canUseSwarmTool(rt.root), true);
+  assert.equal(await rt.host.steerRoot('root', 'on', 'on'), true);
+  assert.equal(rt.root.steers.length, steers + 1);
+});

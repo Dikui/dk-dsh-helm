@@ -14,7 +14,7 @@ const snapshot = (etag='etag-a', fields={}) => ({kind:'snapshot',etag,view:view(
 const delta = (etag,baseEtag,firstSeq,fields) => ({kind:'delta',etag,baseEtag,firstSeq,view:view(fields)});
 const ok = value => ({ok:true,value});
 
-function harness(t,{hidden=false, ignoresAbort=false}={}) {
+function harness(t,{hidden=false, ignoresAbort=false, primitives=null}={}) {
   t.mock.timers.enable({apis:['setTimeout']});
   const ui=renderer(), doc=Object.assign(new EventTarget(),{hidden});
   const defs=[], slots=[], disposers=[], calls=[];
@@ -27,7 +27,11 @@ function harness(t,{hidden=false, ignoresAbort=false}={}) {
   };
   vm.runInNewContext(source,{window:{__ModuleLoader__:{load(v){pkg=v;}}},document:doc,fetch,AbortController,setTimeout,clearTimeout});
   assert.equal(pkg.id,'@local/dk-dsh-swarm');
-  const mod=pkg.factory(key=>{assert.equal(key,'react');return ui.react;});
+  const mod=pkg.factory(key=>{
+    if(key==='react') return ui.react;
+    if(key==='@deepseek-ai/dsh-client-ui-primitives'&&primitives) return primitives(ui.react);
+    assert.equal(key,'react');return ui.react;
+  });
   // No remote.commands in this context: polling must never create transcript records.
   mod.apply({locale:{register(){return ()=>{};},bind(){return k=>k;}},effect(fn){disposers.push(fn());},
     sidebarRightTabs:{register(def){defs.push(def);return ()=>defs.pop();}},
@@ -198,4 +202,66 @@ test('an invalid response to full recovery backs off without reusing the broken 
   const bad=delta('x','unknown',null,{});await h.reply(bad);await h.reply(bad);
   assert.equal(h.calls.length,3);assert.match(h.text(),/retrying.*Hive/);
   await h.tick(3000);assert.equal(h.calls[3].body.cursor,null);
+});
+
+test('the model menu switch is root-only, lazy and writes the session mode',async t=>{
+  const h=harness(t);
+  const entry=h.slots.find(([spec])=>spec.name==='conversation.input.model.options');
+  assert.ok(entry,'model options slot is registered');
+  const [spec,Body]=entry;
+  const panel=Body({...spec.inject('root-A'),locked:false,reportFailure(){}});
+  h.ui.render(panel);
+  assert.equal(h.calls.length,1);assert.equal(h.calls[0].url,'api/dk-swarm/mode');
+  assert.deepEqual(h.calls[0].body,{sessionId:'root-A'});
+  await h.reply({root:true,exists:false,enabled:false,title:null});
+  let tree=h.ui.render(panel);
+  assert.match(h.ui.text(tree),/swarm/);
+  let toggle=h.ui.scan(tree,e=>e.type==='button'&&e.props.role==='switch')[0];
+  assert.ok(toggle);assert.equal(toggle.props['aria-checked'],false);
+  const clicked=toggle.props.onClick();
+  assert.deepEqual(h.calls[1].body,{sessionId:'root-A',enabled:true});
+  await h.reply({root:true,exists:true,enabled:true,title:'Hive'});
+  await clicked;
+  tree=h.ui.render(panel);
+  toggle=h.ui.scan(tree,e=>e.type==='button'&&e.props.role==='switch')[0];
+  assert.equal(toggle.props['aria-checked'],true);
+});
+
+test('the model menu switch stays hidden for a child or an unreadable session',async t=>{
+  const h=harness(t);
+  const [spec,Body]=h.slots.find(([spec])=>spec.name==='conversation.input.model.options');
+  const panel=Body(spec.inject('child-A'));
+  h.ui.render(panel);
+  await h.respond({ok:false,error:{code:'swarm/forbidden',message:'local only'}},403);
+  assert.equal(h.ui.text(h.ui.render(panel)),'');
+});
+
+test('the model menu uses the shared switch and info primitives when the host exposes them',async t=>{
+  const native={};
+  const primitives=React=>{
+    const h=React.createElement;
+    native.Switch=({checked,disabled,label,onChange})=>h('button',{type:'button',role:'switch',
+      'aria-checked':checked,disabled,onClick:()=>onChange(!checked)},label);
+    native.Tooltip=({label,children})=>h('span',{'data-native-tooltip':label},children);
+    native.Button=({children,...props})=>h('button',props,children);
+    native.IconInfoOutlineRegular=({size})=>h('span',{'data-native-info':String(size)});
+    return {Switch:native.Switch,Tooltip:native.Tooltip,Button:native.Button,IconInfoOutlineRegular:native.IconInfoOutlineRegular};
+  };
+  const h=harness(t,{primitives});
+  const [spec,Body]=h.slots.find(([spec])=>spec.name==='conversation.input.model.options');
+  const panel=Body({...spec.inject('root-A'),locked:false,reportFailure(){}});
+  h.ui.render(panel);await h.reply({root:true,exists:true,enabled:false,title:'Hive'});
+  let tree=h.ui.render(panel);
+  let toggle=h.ui.scan(tree,e=>e.type===native.Switch)[0];
+  assert.ok(toggle,'the shared Switch is used');
+  assert.equal(toggle.props.checked,false);
+  const icon=h.ui.scan(tree,e=>e.type===native.IconInfoOutlineRegular)[0];
+  assert.ok(icon,'the shared info icon is used');assert.equal(icon.props.size,11);
+  assert.equal(h.ui.scan(tree,e=>e.type===native.Tooltip)[0].props.label,'swarmHint');
+  toggle.props.onChange(true);
+  assert.deepEqual(h.calls[1].body,{sessionId:'root-A',enabled:true});
+  await h.reply({root:true,exists:true,enabled:true,title:'Hive'});await flush();
+  tree=h.ui.render(panel);
+  toggle=h.ui.scan(tree,e=>e.type===native.Switch)[0];
+  assert.equal(toggle.props.checked,true);
 });

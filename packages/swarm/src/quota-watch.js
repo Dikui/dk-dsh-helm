@@ -16,7 +16,7 @@ export class WalletAlerts {
     if (this.busy || this.host.disposed) return;
     const watches = this.host.state.roots().flatMap(rootId => {
       const board = this.host.state.board(rootId);
-      return board?.quotaWatch && this.host.state.rootAgent(rootId) && Object.values(board.members).some(m => m.role !== 'coordinator' && m.status !== 'killed')
+      return board && board.enabled !== false && board.quotaWatch && this.host.state.rootAgent(rootId) && Object.values(board.members).some(m => m.role !== 'coordinator' && m.status !== 'killed')
         ? [{ rootId, watch: board.quotaWatch }] : [];
     });
     if (!watches.length) return;

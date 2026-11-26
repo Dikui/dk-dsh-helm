@@ -1,5 +1,5 @@
 {
-  "name": "@local/dk-dsh-boost", "version": "0.0.5", "private": true,
+  "name": "@local/dk-dsh-boost", "version": "0.0.6", "private": true,
   "description": "Run one implementation pass and a fresh evidence-first review in DeepSeek Harness.",
   "type": "module", "license": "UNLICENSED", "engines": {"dsh": "0.2.2-rc.5"},
   "main": "./index.js", "icon": "./icon.svg",

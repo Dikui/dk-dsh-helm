@@ -727,6 +727,15 @@ function setTitle(draft, actor, action) {
   return ok({ title });
 }
 
+// The session-level switch only decides whether the root sees Swarm at all.
+// Existing boards default to on; the field is persisted so a reload keeps it.
+function setEnabled(draft, actor, action) {
+  if (actor.role !== 'coordinator') return fail(ERRORS.FORBIDDEN, 'coordinator only');
+  if (typeof action.enabled !== 'boolean') return fail(ERRORS.INVALID_ARGUMENT, 'enabled must be a boolean');
+  draft.enabled = action.enabled;
+  return ok({ enabled: draft.enabled });
+}
+
 function isJsonSafe(value, seen = new Set(), depth = 0) {
   if (depth > 64) return false;
   if (value === null) return true;
@@ -1607,6 +1616,7 @@ export function newBoard(rootId, title = 'Swarm', options = {}) {
     version: VERSION,
     rootId,
     title: cleanTitle,
+    enabled: options.enabled !== false,
     createdAt: now,
     clock: now,
     updatedAt: now,
@@ -1672,6 +1682,7 @@ export function transition(board, actorSessionId, action) {
   }
   const draft = clone(board);
   draft.deliveries ??= []; // Boards persisted before member delivery acceptance.
+  draft.enabled ??= true; // Boards persisted before the session-level switch.
   draft.clock = Math.max(draft.clock ?? 0, now);
   draft.updatedAt = draft.clock;
   const actorId = actorSessionId ?? null;
@@ -1749,6 +1760,12 @@ export function transition(board, actorSessionId, action) {
       const denied = requireActor();
       if (denied) outcome = denied;
       else outcome = setTitle(draft, actor, action);
+      break;
+    }
+    case 'setEnabled': {
+      const denied = requireActor();
+      if (denied) outcome = denied;
+      else outcome = setEnabled(draft, actor, action);
       break;
     }
     case 'assignDelivery': {

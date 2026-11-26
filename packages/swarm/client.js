@@ -2,10 +2,13 @@ window.__ModuleLoader__.load({
   id: '@local/dk-dsh-swarm',
   factory(require) {
     const React = require('react'), h = React.createElement;
+    // The shared model menu control is the app's own primitives. Fall back to
+    // the local control only for hosts and tests that do not expose it.
+    const primitives = (() => { try { return require('@deepseek-ai/dsh-client-ui-primitives') ?? null; } catch { return null; } })();
     const id = '@local/dk-dsh-swarm', ns = 'dkSwarm', pages = ['overview','board','members','graph'];
     const dictionaries = {
-      en: { title:'Swarm board', guide:'Messages, members and directed mentions in this session.', live:'Live', refresh:'Refresh now', loading:'Reading…', retry:'Retry now', retrying:'Could not refresh. Retrying automatically.', unavailable:'Live view unavailable. Use /swarm view in the local root session.', start:'Boards are shown in their root session. Switch back to the root session; if it has no board, run /swarm init.', overview:'Overview', board:'Board', members:'Members', graph:'Mention graph', all:'All channels', empty:'Nothing in this snapshot.', seq:'Snapshot', goal:'Goal', tasks:'Tasks', threads:'Threads', unread:'unread', cutoff:'Through message', edges:'Directed mentions in the displayed message window', active:'active', count:'members', channel:'Channel', window:'Latest messages in this snapshot'},
-      zh: { title:'Swarm 黑板', guide:'查看本会话的消息、成员及定向呼唤。', live:'实时', refresh:'立即刷新', loading:'读取中…', retry:'立即重试', retrying:'刷新失败，将自动重试。', unavailable:'实时视图不可用。可在本机根会话使用 /swarm view。', start:'此面板只显示根会话的黑板。若在子会话请切回根会话；尚未建板可运行 /swarm init。', overview:'概览', board:'黑板', members:'成员', graph:'呼唤关系', all:'所有频道', empty:'当前快照暂无记录。', seq:'快照', goal:'目标', tasks:'任务', threads:'讨论线', unread:'未读', cutoff:'截至消息', edges:'当前消息窗口内的定向呼唤', active:'活跃', count:'成员', channel:'频道', window:'当前快照中的近期消息'},
+      en: { title:'Swarm board', guide:'Messages, members and directed mentions in this session.', live:'Live', refresh:'Refresh now', loading:'Reading…', retry:'Retry now', retrying:'Could not refresh. Retrying automatically.', unavailable:'Live view unavailable. Use /swarm view in the local root session.', start:'Boards are shown in their root session. Switch back to the root session; if it has no board, run /swarm init.', overview:'Overview', board:'Board', members:'Members', graph:'Mention graph', all:'All channels', empty:'Nothing in this snapshot.', seq:'Snapshot', goal:'Goal', tasks:'Tasks', threads:'Threads', unread:'unread', cutoff:'Through message', edges:'Directed mentions in the displayed message window', active:'active', count:'members', channel:'Channel', window:'Latest messages in this snapshot', swarm:'Swarm', swarmHint:'Expose this session’s Swarm tools and reminders only while on.', swarmFailed:'Could not change Swarm mode.'},
+      zh: { title:'Swarm 黑板', guide:'查看本会话的消息、成员及定向呼唤。', live:'实时', refresh:'立即刷新', loading:'读取中…', retry:'立即重试', retrying:'刷新失败，将自动重试。', unavailable:'实时视图不可用。可在本机根会话使用 /swarm view。', start:'此面板只显示根会话的黑板。若在子会话请切回根会话；尚未建板可运行 /swarm init。', overview:'概览', board:'黑板', members:'成员', graph:'呼唤关系', all:'所有频道', empty:'当前快照暂无记录。', seq:'快照', goal:'目标', tasks:'任务', threads:'讨论线', unread:'未读', cutoff:'截至消息', edges:'当前消息窗口内的定向呼唤', active:'活跃', count:'成员', channel:'频道', window:'当前快照中的近期消息', swarm:'Swarm', swarmHint:'开启后才会向本会话注入 Swarm 工具和提醒。', swarmFailed:'无法切换 Swarm 开关。'},
     };
     const box = {padding:'0.8rem',display:'grid',alignContent:'start',gap:'0.7rem',height:'100%',overflow:'auto',boxSizing:'border-box',overflowWrap:'anywhere'};
     function list(rows, render, t) { return rows.length?h('ul',{style:{paddingInlineStart:'1.3em',margin:0}},rows.map(render)):h('p',null,t('empty')); }
@@ -159,6 +162,88 @@ window.__ModuleLoader__.load({
     }
     // The slot inject callback receives the owning session, including in a floating pane.
     function Body(props){return h(Snapshot,{...props,key:props.boardOwner});}
+    // Session-level switch in the model menu. The row exists only for a root;
+    // the read never creates a board, and the write is rejected by the Host for
+    // children. Turning it on later lazily creates the board.
+    async function readMode(sessionId, signal, enabled) {
+      const body = enabled === undefined ? {sessionId} : {sessionId, enabled};
+      const response = await fetch('api/dk-swarm/mode', {method:'POST', headers:{'content-type':'application/json'},
+        body:JSON.stringify(body), signal});
+      if (!response.ok) throw Object.assign(Error(`Swarm mode: HTTP ${response.status}`), {status:response.status});
+      const result = await response.json();
+      if (result?.ok !== true) throw Object.assign(Error(result?.error?.message ?? 'Swarm mode error'), {code:result?.error?.code});
+      return result.value ?? {};
+    }
+    function SwarmMode({sessionId,t,locked=false,reportFailure}) {
+      const [swarm,setSwarm]=React.useState({loaded:false,root:false,enabled:false,busy:false,error:''});
+      const [hover,setHover]=React.useState(false);
+      const mounted=React.useRef(true);
+      const inFlight=React.useRef(null);
+      React.useEffect(()=>{
+        mounted.current=true;
+        const request=new AbortController();
+        readMode(sessionId,request.signal).then(value=>{
+          if (mounted.current) setSwarm({loaded:true,root:value.root===true,enabled:value.enabled===true,busy:false,error:''});
+        }).catch(()=>{
+          // A child, a stale session or a transport error must never add a
+          // model-menu row; the sidebar remains the explicit diagnostics path.
+          if (mounted.current) setSwarm({loaded:true,root:false,enabled:false,busy:false,error:''});
+        });
+        return ()=>{mounted.current=false;request.abort();inFlight.current?.abort();};
+      },[sessionId]);
+      if (!swarm.loaded||!swarm.root) return null;
+      const pending=swarm.busy;
+      async function toggle(next=!swarm.enabled) {
+        if (pending||locked||typeof next!=='boolean') return;
+        setSwarm({...swarm,busy:true,error:''});
+        inFlight.current?.abort();
+        const request=new AbortController();
+        inFlight.current=request;
+        try {
+          const value=await readMode(sessionId,request.signal,next);
+          if (mounted.current) setSwarm({loaded:true,root:true,enabled:value.enabled===true,busy:false,error:''});
+        } catch {
+          const message=t('swarmFailed');
+          if (mounted.current) setSwarm({...swarm,busy:false,error:message});
+          if (mounted.current && typeof reportFailure==='function') reportFailure(message);
+        } finally {
+          if (inFlight.current===request) inFlight.current=null;
+        }
+      }
+      const hint=t('swarmHint');
+      const nativeSwitch=primitives?.Switch;
+      const info=primitives?.Tooltip&&primitives?.Button&&primitives?.IconInfoOutlineRegular
+        ? h(primitives.Tooltip,{label:hint,side:'top',delayMs:300,maxWidth:300,portal:true,openOnClick:true},
+            h(primitives.Button,{variant:'ghost',size:'sm','aria-label':hint,
+              style:{position:'relative',zIndex:1,flex:'none',width:20,height:20,minWidth:20,minHeight:20,padding:0,
+                color:'var(--dsw-alias-label-caption)'}},
+              h(primitives.IconInfoOutlineRegular,{size:11,'aria-hidden':'true'})))
+        : h('span',{role:'img','aria-label':hint,title:hint,style:{flex:'none',display:'inline-flex',alignItems:'center',
+            justifyContent:'center',width:12,height:12,border:'1px solid currentColor',borderRadius:'50%',fontSize:8,
+            lineHeight:1,color:'var(--dsw-alias-label-caption)',cursor:'help'}},'i');
+      return h('div',{onMouseEnter:()=>setHover(true),onMouseLeave:()=>setHover(false),
+        style:{position:'relative',display:'flex',alignItems:'center',justifyContent:'space-between',gap:'16px',minHeight:34,
+          padding:'0 8px',borderRadius:'var(--dsw-radius-md)',color:'var(--dsw-alias-label-primary)',fontSize:13,
+          lineHeight:'20px',background:hover?'var(--dsw-alias-interactive-bg-hover)':'transparent',
+          transition:'background 120ms ease'}},
+        h('div',{style:{display:'flex',flexDirection:'column',gap:'2px',minWidth:0}},
+          h('div',{style:{display:'inline-flex',alignItems:'center',gap:'4px',minWidth:0}},
+            h('span',null,t('swarm')),
+            info),
+          swarm.error&&h('small',{role:'alert',style:{fontSize:11,lineHeight:'16px',color:'var(--dsw-alias-state-error-primary)'}},swarm.error)),
+        nativeSwitch
+          ? h(nativeSwitch,{checked:swarm.enabled,disabled:pending||locked,label:t('swarm'),
+              onChange:value=>{if(!pending&&!locked) void toggle(value);}})
+          : h('button',{type:'button',role:'switch','aria-checked':swarm.enabled,'aria-label':t('swarm'),title:hint,
+              disabled:pending||locked,onClick:()=>toggle(),style:{flex:'none',width:34,height:20,padding:0,border:0,borderRadius:10,
+                cursor:pending||locked?'default':'pointer',background:swarm.enabled?'#2f7cf6':'rgba(127,127,127,0.35)',
+                opacity:pending?0.6:locked?0.5:1,transition:'background 120ms ease'}},
+              h('span',{style:{display:'block',width:16,height:16,margin:2,marginLeft:swarm.enabled?16:2,borderRadius:'50%',
+                background:'#fff',boxShadow:'0 1px 2px rgba(0,0,0,0.25)',transition:'margin-left 120ms ease'}})));
+    }
+    // A function component wrapper keeps the slot's hooks inside React's
+    // renderer; the slot registry is handed a component, not the hook body.
+    function SwarmModeSlot(props){return h(SwarmMode,props);}
     function bindBoard(sessionId) {
       return {boardOwner:sessionId, async loadBoard(cursor,signal) {
         const response = await fetch('api/dk-swarm/liveView', {method:'POST', headers:{'content-type':'application/json'},
@@ -173,6 +258,7 @@ window.__ModuleLoader__.load({
       ctx.effect(()=>ctx.locale.register(ns,dictionaries)); const t=ctx.locale.bind(ns);
       ctx.effect(()=>ctx.sidebarRightTabs.register({id,kind:'swarm-board',title:()=>t('title'),guide:[{id:'board',order:80,title:()=>t('title'),description:()=>t('guide')}]}));
       ctx.slots.inject('sidebar.right.pane.tab',()=>ctx.slots.register({name:'sidebar.right.pane.tab',key:id,locale:ns,inject:bindBoard},Body));
+      ctx.slots.inject('conversation.input.model.options',()=>ctx.slots.register({name:'conversation.input.model.options',id:'swarm',locale:ns,inject:sessionId=>({sessionId,t})},SwarmModeSlot));
     }};
   },
 });

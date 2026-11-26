@@ -284,7 +284,8 @@ export function registerSwarmTools(host) {
     },
   }, ({agent}) => {
     const e = host.state.resolve(agent);
-    return Boolean(e?.self && !['paused','killed'].includes(e.status) && (e.isRoot ? (Object.keys(e.board.members).length > 1) : e.board.deliveries?.some(d => d.owner === agent.id)));
+    return Boolean(e?.self && !['paused','killed'].includes(e.status)
+      && (e.isRoot ? e.board.enabled !== false && Object.keys(e.board.members).length > 1 : e.board.deliveries?.some(d => d.owner === agent.id)));
   });
 
   register(

@@ -1385,3 +1385,23 @@ test('state and views are strict JSON', () => {
 function assertJson(value) {
   assert.deepEqual(JSON.parse(JSON.stringify(value)), value);
 }
+
+test('the session switch is coordinator-only, boolean, durable and defaults legacy boards on', () => {
+  const board = seedBoard();
+  assert.equal(board.enabled, true);
+  const withWorker = addWorker(board).state;
+  assertFailure(transition(withWorker, WORKER, { type: 'setEnabled', enabled: false }), ERRORS.FORBIDDEN);
+  assertFailure(transition(board, COORD, { type: 'setEnabled', enabled: 'no' }), ERRORS.INVALID_ARGUMENT);
+  const off = transition(board, COORD, { type: 'setEnabled', enabled: false });
+  assert.equal(off.result.ok, true);
+  assert.deepEqual(off.result, { ok: true, enabled: false });
+  assert.equal(off.state.enabled, false);
+  assert.equal(board.enabled, true, 'transition stays pure');
+  const on = transition(off.state, COORD, { type: 'setEnabled', enabled: true });
+  assert.equal(on.state.enabled, true);
+  const legacy = structuredClone(board);
+  delete legacy.enabled;
+  const touched = transition(legacy, COORD, { type: 'setEnabled', enabled: false });
+  assert.equal(touched.state.enabled, false);
+  assert.equal(newBoard(ROOT, 'Swarm', { coordinator: COORD, now: T0, enabled: false }).enabled, false);
+});

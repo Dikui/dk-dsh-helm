@@ -145,7 +145,9 @@ export class SwarmHost {
     this.interval.unref?.();
     if (typeof startStallMonitor === 'function') {
       const disposer = startStallMonitor({
-        list: () => this.state.roots().map((root) => this.state.board(root)).filter(Boolean),
+        list: () => this.state.roots()
+          .map((root) => this.state.board(root))
+          .filter((board) => board && board.enabled !== false),
         notify: (rootId, message) => this.steerRoot(rootId, message, 'Swarm board reminder'),
         ack: async (rootId, alert) => {
           const {result} = await this.state.act(rootId, rootId, {type:'ackBoardAlert', alert});
@@ -673,6 +675,7 @@ export class SwarmHost {
     if (!entry.isRoot) {
       throw failure('FORBIDDEN', `only the swarm root can use this; you are member "${entry.self?.name ?? '?'}"`);
     }
+    if (entry.board.enabled === false) throw failure('CLOSED', 'swarm is off for this session');
     return entry;
   }
 
@@ -681,23 +684,91 @@ export class SwarmHost {
     if (!entry || !entry.self) throw failure('NOT_MEMBER', 'you are not a member of this swarm');
     if (entry.self.status === 'killed') throw failure('CLOSED', 'this member has been killed');
     if (entry.self.status === 'paused') throw failure('PAUSED', 'this member is paused');
+    if (entry.isRoot && entry.board.enabled === false) throw failure('CLOSED', 'swarm is off for this session');
     return entry;
   }
 
   canUseSwarmTool(agent) {
     const entry = this.state.resolve(agent);
-    return Boolean(entry?.isRoot && entry.self?.status !== 'killed');
+    return Boolean(entry?.isRoot && entry.board?.enabled !== false && entry.self?.status !== 'killed');
   }
 
   canUseSocialTool(agent) {
     const entry = this.state.resolve(agent);
     if (!entry?.self || entry.self.status === 'killed') return false;
     if (entry.isRoot) {
+      if (entry.board.enabled === false) return false;
       return Object.values(entry.board.members ?? {}).some(
         (member) => member.role !== 'coordinator' && member.status !== 'killed',
       );
     }
     return true;
+  }
+
+  /** Read the session-level switch without creating or waking anything. */
+  mode(sessionId) {
+    if (typeof sessionId !== 'string' || !sessionId) {
+      return { root: false, exists: false, enabled: false, title: null };
+    }
+    const board = this.state.board(sessionId);
+    if (board?.rootId === sessionId) {
+      return {
+        root: true,
+        exists: true,
+        enabled: board.enabled !== false,
+        title: board.title ?? null,
+      };
+    }
+    const agent = this.ctx.agents?.get?.(sessionId) ?? null;
+    if (!agent) return { root: false, exists: false, enabled: false, title: null };
+    const known = this.state.resolve(agent);
+    if (known && !known.isRoot) return { root: false, exists: false, enabled: false, title: null };
+    let root = null;
+    try {
+      root = this.ctx.subagents?.rootOf?.(agent) ?? null;
+    } catch {
+      root = null;
+    }
+    if (root && root !== agent) return { root: false, exists: false, enabled: false, title: null };
+    return { root: true, exists: false, enabled: false, title: null };
+  }
+
+  /**
+   * Turn the root's Swarm context on or off. Turning it on creates the board
+   * when needed; turning it off keeps the durable board and its members.
+   */
+  async setEnabled(rootId, enabled) {
+    if (typeof rootId !== 'string' || !rootId) {
+      throw failure('INVALID_SESSION', 'a live root session is required');
+    }
+    if (typeof enabled !== 'boolean') throw failure('INVALID_ARGUMENT', 'enabled must be a boolean');
+    const rootAgent = this.state.rootAgent(rootId);
+    if (!rootAgent) throw failure('NOT_FOUND', 'root session is not live');
+    let root = null;
+    try {
+      root = this.ctx.subagents?.rootOf?.(rootAgent) ?? null;
+    } catch {
+      root = null;
+    }
+    if (root && root !== rootAgent) throw failure('FORBIDDEN', 'only the root session can manage Swarm mode');
+    const known = this.state.resolve(rootAgent);
+    if (known && !known.isRoot) throw failure('FORBIDDEN', 'only the root session can manage Swarm mode');
+    let board = this.state.board(rootId);
+    let created = false;
+    if (!board) {
+      if (!enabled) return { created: false, enabled: false, title: null };
+      board = await this.state.create(rootAgent);
+      created = true;
+    } else {
+      const out = await this.state.act(rootId, rootId, { type: 'setEnabled', enabled });
+      if (!out.result?.ok) throw failure(out.result.code, out.result.message);
+      board = out.state;
+    }
+    if (enabled) {
+      await this.activateRoot(rootAgent);
+      if (!created) await this.deliverPending(rootId);
+    }
+    return { created, enabled: board.enabled !== false, title: board.title ?? null };
   }
 
   // -------------------------------------------------------------------------
@@ -1515,6 +1586,8 @@ export class SwarmHost {
       const key = `${wake.sessionId}:${wake.seq}`;
       if (seen.has(key)) continue;
       seen.add(key);
+      // Off means the root gets no doorbells; member wakes keep flowing.
+      if (wake.sessionId === rootId && board.enabled === false) continue;
       const member = this.state.member(rootId, wake.sessionId);
       if (!member || member.status === 'killed' || member.status === 'paused') continue;
       if (wake.seq <= member.lastReadSeq) {
@@ -1555,6 +1628,7 @@ export class SwarmHost {
     if (this.disposed || !entry?.board || !entry.self) return null;
     const member = entry.self;
     if (member.status === 'killed' || member.status === 'paused') return null;
+    if (entry.isRoot && entry.board.enabled === false) return null;
     const api = this.state.api;
     if (typeof api?.visiblePosts !== 'function') return null;
     const posts = api.visiblePosts(entry.board, member.sessionId, {
@@ -1617,6 +1691,10 @@ export class SwarmHost {
   }
 
   async steerRoot(rootId, text, summary) {
+    // Every root-facing notice goes through here: a switched-off board must not
+    // inject reminders, quota notices or member-stop messages into the model.
+    const board = this.state.board(rootId);
+    if (!board || board.enabled === false) return false;
     const root = this.state.rootAgent(rootId);
     if (!root) return false;
     const message = await this.makeMessage(text, summary);
