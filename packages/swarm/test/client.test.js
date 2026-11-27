@@ -266,3 +266,32 @@ test('the model menu uses the shared switch and info primitives when the host ex
   toggle=h.ui.scan(tree,e=>e.type===native.Switch)[0];
   assert.equal(toggle.props.checked,true);
 });
+
+test('model candidates save the catalog model id, not its display name',async t=>{
+  const catalog={ok:true,value:{groups:[{id:'deepseek',name:'DeepSeek',models:[
+    {id:'deepseek-v4.1-flash',name:'DeepSeek V4.1 Flash'},
+  ]}]}};
+  const h=harness(t,{catalog});
+  h.mount();await h.reply(snapshot());
+  await h.click('options');
+  const page=h.ui.scan(h.tree(),e=>typeof e.type==='function'&&e.type.name==='ModelOptionsPage')[0];
+  assert.ok(page,'the candidates page is mounted');
+  h.ui.render(page);await flush();
+  assert.equal(h.calls[1].url,'api/dk-swarm/model-options');
+  await h.reply({options:[]});await flush();
+  const pageText=()=>h.ui.text(h.ui.render(page));
+  assert.match(pageText(),/DeepSeek V4\.1 Flash/);
+  const box=h.ui.scan(h.ui.render(page),e=>e.type==='input'&&e.props.type==='checkbox')[0];
+  assert.ok(box,'catalog row checkbox exists');
+  box.props.onChange();
+  assert.doesNotMatch(pageText(),/unavailableSaved/);
+  const save=h.ui.scan(h.ui.render(page),e=>e.type==='button'&&h.ui.text(e)==='save')[0];
+  assert.ok(save);assert.equal(save.props.disabled,false);
+  save.props.onClick();
+  const call=h.calls[h.calls.length-1];
+  assert.equal(call.url,'api/dk-swarm/model-options');
+  assert.equal(call.opts.method,'POST');
+  assert.deepEqual(call.body,{options:[{provider:'deepseek',model:'deepseek-v4.1-flash'}]});
+  await h.reply({options:[{provider:'deepseek',model:'deepseek-v4.1-flash'}]});await flush();
+  assert.doesNotMatch(pageText(),/unavailableSaved/);
+});

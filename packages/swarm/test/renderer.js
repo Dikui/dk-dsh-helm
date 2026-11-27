@@ -4,10 +4,16 @@ export function renderer(){
   const instances=new Map();
   const dispose=inst=>inst?.effects.forEach(fn=>fn?.());
   const react={createElement:(type,props,...children)=>({type,props:props??{},children:children.flat(Infinity)}),Fragment:Symbol('fragment'),
-    useState(value){const {cells}=instance,i=cursor++;if(!(i in cells))cells[i]=value;return [cells[i],v=>{writes++;cells[i]=v;}];},
+    useState(value){const {cells}=instance,i=cursor++;if(!(i in cells))cells[i]=value;return [cells[i],v=>{writes++;cells[i]=typeof v==='function'?v(cells[i]):v;}];},
     useRef(value){const i=cursor++;return instance.cells[i]??={current:value};},
     useEffect(fn,deps){const {cells,effects}=instance,i=cursor++;
-      if(!cells[i]||deps.some((v,j)=>cells[i][j]!==v)){effects[i]?.();cells[i]=deps;effects[i]=fn();}}};
+      if(!cells[i]||deps.some((v,j)=>cells[i][j]!==v)){effects[i]?.();cells[i]=deps;effects[i]=fn();}},
+    useCallback(fn,deps){return stable('callback',()=>fn,deps);},
+    useMemo(fn,deps){return stable('memo',fn,deps);}};
+  const stable=(kind,compute,deps)=>{const {cells}=instance,i=cursor++,prev=cells[i];
+    if(!prev||prev.kind!==kind||prev.deps.length!==deps.length||deps.some((v,j)=>prev.deps[j]!==v)){
+      cells[i]={kind,deps,value:compute()};}
+    return cells[i].value;};
   const render=el=>{
     instance=instances.get(el.type);
     if(!instance||instance.key!==el.props.key){dispose(instance);instance={key:el.props.key,cells:[],effects:[]};instances.set(el.type,instance);}

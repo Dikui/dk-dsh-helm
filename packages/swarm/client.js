@@ -306,12 +306,12 @@ window.__ModuleLoader__.load({
         } catch (err) { setError(String(err?.message ?? err)); }
         finally { setSaving(false); }
       };
-      const row = (provider, model, meta, description) => {
+      const row = (provider, model, name, meta, description) => {
         const checked = draft.some(route => route.provider === provider && route.model === model);
         return h('label', {className:'dk-helm-opt-row', key:`${provider}/${model}`},
           h('input', {type:'checkbox', checked, onChange:() => toggle(provider, model)}),
           h('span', {className:'dk-helm-opt-body'},
-            h('span', {className:'dk-helm-opt-name'}, model),
+            h('span', {className:'dk-helm-opt-name'}, name),
             h('span', {className:'dk-helm-opt-meta'}, meta),
             description && h('span', {className:'dk-helm-opt-desc'}, description)));
       };
@@ -328,13 +328,13 @@ window.__ModuleLoader__.load({
           draft.length === 0 && safeGroups.length === 0 && h('p', {className:'dk-helm-muted'}, t('modelOptionsEmpty')),
           unavailable.length > 0 && h('section', {className:'dk-helm-opt-group dk-helm-opt-warn'},
             h('div', {className:'dk-helm-opt-head'}, h('strong', null, t('unavailableSaved')), h('span', null, String(unavailable.length))),
-            unavailable.map(route => row(route.provider, route.model,
+            unavailable.map(route => row(route.provider, route.model, route.model,
               `${route.provider}/${route.model} · ${t('unavailableHint')}`))),
           filtered.map(group => h('section', {className:'dk-helm-opt-group', key:group.id},
             h('div', {className:'dk-helm-opt-head'},
               h('strong', null, group.name ?? group.id),
               h('span', null, `${group.id} · ${countFor(group.id)}/${group.models.length} ${t('selected')}`)),
-            group.models.map(model => row(group.id, model.name ?? model.id,
+            group.models.map(model => row(group.id, model.id, model.name ?? model.id,
               `${group.name ?? group.id} · ${group.id}/${model.id}`, model.description)))),
           filtered.length === 0 && needle && h('p', {className:'dk-helm-empty'}, t('noMatch')),
           h('details', {className:'dk-helm-opt-manual'},
