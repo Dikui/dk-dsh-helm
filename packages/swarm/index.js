@@ -5,7 +5,8 @@ import { BoardState } from './src/host-state.js';
 import { SwarmHost } from './src/host-runtime.js';
 import { registerSwarmTools } from './src/host-tools.js';
 import { registerSwarmCommands } from './src/host-commands.js';
-import { registerSwarmLive, registerSwarmMode } from './src/host-live.js';
+import { registerSwarmLive, registerSwarmMode, registerSwarmModelOptions } from './src/host-live.js';
+import { createModelOptions } from './src/model-options.js';
 
 export const name = 'dk-dsh-swarm';
 export const inject = ['storageDomain', 'subagents', 'tools', 'commands', 'workingDirectory', 'agents'];
@@ -32,6 +33,7 @@ export async function apply(ctx) {
     channels: channelApi,
     logger: ctx.logger,
   });
+  const modelOptions = createModelOptions(store);
   host = new SwarmHost({
     ctx,
     store,
@@ -44,6 +46,7 @@ export async function apply(ctx) {
   registerSwarmTools(host);
   registerSwarmCommands(host);
   registerSwarmLive(host);
+  registerSwarmModelOptions(host, modelOptions);
   registerSwarmMode(host);
 
   return () => host?.close();

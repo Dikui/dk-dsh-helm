@@ -66,6 +66,40 @@ export function registerSwarmLive(host) {
 }
 
 /**
+ * Candidate model routes for the Helm panel. This is not an authorization
+ * source: dispatch still validates the root Session's model-selection policy.
+ * The list is profile-level, so no session id is accepted or inferred.
+ */
+export function registerSwarmModelOptions(host, modelOptions) {
+  host.ctx.inject(['connection', 'webServer'], (ctx) => {
+    ctx.connection.fetch.register({
+      path: '/api/dk-swarm/model-options', methods: ['GET', 'POST'], requestBody: 'buffered',
+      async fetch(request) {
+        const { peer } = ctx.connection.admit(request);
+        if (!localBrowserOwner(ctx, peer)) return failure(403, 'swarm/forbidden', 'Only the local Host owner can edit Swarm model options.');
+        if (request.method === 'GET') return response({ ok: true, value: { options: modelOptions.read() } });
+        let payload;
+        if (request.headers.get('content-type')?.split(';')[0].trim().toLowerCase() === 'application/json') {
+          payload = await request.json().catch(() => null);
+        }
+        request.signal.throwIfAborted();
+        if (!payload || typeof payload !== 'object' || Array.isArray(payload)
+          || !Object.hasOwn(payload, 'options')
+          || Object.keys(payload).some(key => key !== 'options')) {
+          return failure(400, 'swarm/bad-request', 'Expected a model options array.');
+        }
+        try {
+          const options = await modelOptions.write(payload.options);
+          return response({ ok: true, value: { options } });
+        } catch (error) {
+          return failure(400, 'swarm/invalid-model-options', error?.message ?? 'Invalid model options.');
+        }
+      },
+    });
+  });
+}
+
+/**
  * Session-level Swarm switch for the model menu. The read is available to the
  * local owner only; the write is root-only and never infers a root from a
  * child's membership. Turning it on creates the board lazily; turning it off

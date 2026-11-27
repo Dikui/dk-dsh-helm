@@ -1,5 +1,5 @@
 {
-  "name": "@local/dk-dsh-swarm", "version": "0.0.6", "private": true,
+  "name": "@local/dk-dsh-swarm", "version": "0.0.7", "private": true,
   "description": "A bounded durable blackboard and member doorbells for DeepSeek Harness.",
   "type": "module", "license": "UNLICENSED", "engines": {"dsh":"0.2.2-rc.5"},
   "main": "./index.js", "icon":"./icon.svg",
@@ -7,6 +7,6 @@
   "bin": {"swarm-seat":"./bin/swarm-seat.js"},
   "files": ["index.js", "client.js", "src", "bin", "locale", "cordis.patch.yml", "icon.svg", "README.md"],
   "dependencies":{"zod":"4.6.6"},
-  "dsh":{"bundle":{"patch":"./cordis.patch.yml"},"client":{"platform":"web","immediately":true,"inject":["@deepseek-ai/dsh-client-locale","@deepseek-ai/dsh-client-ui-sidebar-right"]}},
+  "dsh":{"bundle":{"patch":"./cordis.patch.yml"},"client":{"platform":"web","immediately":true,"inject":["@deepseek-ai/dsh-client-locale","@deepseek-ai/dsh-api-remotes"]}},
   "scripts":{"check":"node --check index.js && node --check client.js && node --test test/*.test.js", "test":"node --test test/*.test.js"}
 }

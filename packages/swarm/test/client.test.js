@@ -5,7 +5,7 @@ import { readFile } from 'node:fs/promises';
 import { renderer } from './renderer.js';
 
 // Small/spec: session-bound live board. Only the clock, document visibility and
-// HTTP boundary are faked; tests enter through the registered sidebar body.
+// HTTP boundary are faked; tests enter through the registered Helm conversation view.
 const source = await readFile(new URL('../client.js', import.meta.url), 'utf8');
 const flush = () => new Promise(resolve => setImmediate(resolve));
 const msg = (seq, overrides={}) => ({seq, author:'scout', channel:'main', text:`note-${seq}.`, ...overrides});
@@ -14,15 +14,15 @@ const snapshot = (etag='etag-a', fields={}) => ({kind:'snapshot',etag,view:view(
 const delta = (etag,baseEtag,firstSeq,fields) => ({kind:'delta',etag,baseEtag,firstSeq,view:view(fields)});
 const ok = value => ({ok:true,value});
 
-function harness(t,{hidden=false, ignoresAbort=false, primitives=null}={}) {
+function harness(t,{hidden=false, ignoresAbort=false, primitives=null, catalog=null}={}) {
   t.mock.timers.enable({apis:['setTimeout']});
   const ui=renderer(), doc=Object.assign(new EventTarget(),{hidden});
   const defs=[], slots=[], disposers=[], calls=[];
   let pkg, panel;
   const fetch=(url,opts)=>{
     const {resolve,reject,promise}=Promise.withResolvers();
-    if(!ignoresAbort) opts.signal.addEventListener('abort',()=>reject(opts.signal.reason),{once:true});
-    calls.push({url,body:JSON.parse(opts.body),opts,resolve,reject});
+    if(!ignoresAbort && opts.signal) opts.signal.addEventListener('abort',()=>reject(opts.signal.reason),{once:true});
+    calls.push({url,body:opts.body?JSON.parse(opts.body):null,opts,resolve,reject});
     return promise;
   };
   vm.runInNewContext(source,{window:{__ModuleLoader__:{load(v){pkg=v;}}},document:doc,fetch,AbortController,setTimeout,clearTimeout});
@@ -35,6 +35,7 @@ function harness(t,{hidden=false, ignoresAbort=false, primitives=null}={}) {
   // No remote.commands in this context: polling must never create transcript records.
   mod.apply({locale:{register(){return ()=>{};},bind(){return k=>k;}},effect(fn){disposers.push(fn());},
     sidebarRightTabs:{register(def){defs.push(def);return ()=>defs.pop();}},
+    remote:{session:{modelCatalog:async()=>catalog??{ok:false,error:{message:'no catalog'}}}},
     slots:{inject(_,fn){disposers.push(fn());},register(spec,Body){slots.push([spec,Body]);return ()=>slots.pop();}}});
   t.after(()=>{ui.close();disposers.reverse().forEach(fn=>fn?.());assert.equal(defs.length,0);assert.equal(slots.length,0);});
   const tree=()=>ui.render(panel);
@@ -58,8 +59,8 @@ function harness(t,{hidden=false, ignoresAbort=false, primitives=null}={}) {
 }
 
 test('opening the session board reads immediately; idle registration never calls the host',async t=>{
-  const h=harness(t); assert.equal(h.defs[0].kind,'swarm-board');assert.equal(h.defs[0].guide.length,1);
-  assert.equal(h.slots[0][0].key,h.defs[0].id);assert.equal(h.calls.length,0);
+  const h=harness(t); assert.equal(h.slots[0][0].name,'conversation.view');assert.equal(h.slots[0][0].id,'helm');
+  assert.equal(h.defs.length,0);assert.equal(h.calls.length,0);
   h.mount(); assert.equal(h.calls.length,1);assert.equal(h.calls[0].url,'api/dk-swarm/liveView');
   assert.equal(h.calls[0].opts.method,'POST');assert.equal(h.calls[0].opts.headers['content-type'],'application/json');
   assert.deepEqual(h.calls[0].body,{sessionId:'root-A',cursor:null});assert.match(h.text(),/loading/);assert.doesNotMatch(h.text(),/start/);
@@ -73,7 +74,7 @@ test('all four views render the same live snapshot, filter channels and replay t
   await h.click('members');assert.match(h.text(),/scout.*paused.*1 unread/);
   await h.click('board');h.ui.scan(h.tree(),e=>e.type==='select')[0].props.onChange({target:{value:'ops'}});
   assert.match(h.text(),/second note/);assert.doesNotMatch(h.text(),/first note/);
-  await h.click('graph');const graph=h.ui.scan(h.tree(),e=>typeof e.type==='function')[0];let replay=h.ui.render(graph);
+  await h.click('graph');const graph=h.ui.scan(h.tree(),e=>typeof e.type==='function'&&e.type.name==='Graph')[0];let replay=h.ui.render(graph);
   assert.equal(h.ui.scan(replay,e=>e.type==='svg').length,1);assert.equal(h.ui.scan(replay,e=>e.type==='li').length,2);
   h.ui.scan(replay,e=>e.type==='input')[0].props.onChange({target:{value:2}});replay=h.ui.render(graph);
   assert.equal(h.ui.scan(replay,e=>e.type==='li').length,1);assert.match(h.ui.text(replay),/lead.*→.*scout/);assert.equal(h.calls.length,1);
