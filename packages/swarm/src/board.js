@@ -736,6 +736,17 @@ function setEnabled(draft, actor, action) {
   return ok({ enabled: draft.enabled });
 }
 
+// Host notices (for example the empty-board nudge) are recorded on the board so
+// a restart cannot deliver a one-shot hint twice. Values are transition clocks.
+function recordNotice(draft, actor, action, now) {
+  if (actor.role !== 'coordinator') return fail(ERRORS.FORBIDDEN, 'coordinator only');
+  if (typeof action.key !== 'string' || !/^[a-z][a-zA-Z0-9]{0,63}$/.test(action.key)) {
+    return fail(ERRORS.INVALID_ARGUMENT, 'notice key is invalid');
+  }
+  draft.notices = { ...(isPlainObject(draft.notices) ? draft.notices : {}), [action.key]: now };
+  return ok({ key: action.key, at: now });
+}
+
 function isJsonSafe(value, seen = new Set(), depth = 0) {
   if (depth > 64) return false;
   if (value === null) return true;
@@ -1766,6 +1777,12 @@ export function transition(board, actorSessionId, action) {
       const denied = requireActor();
       if (denied) outcome = denied;
       else outcome = setEnabled(draft, actor, action);
+      break;
+    }
+    case 'recordNotice': {
+      const denied = requireActor();
+      if (denied) outcome = denied;
+      else outcome = recordNotice(draft, actor, action, now);
       break;
     }
     case 'assignDelivery': {

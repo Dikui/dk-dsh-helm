@@ -32,8 +32,25 @@ const SWITCH_TIMEOUT_MS = 5_000;
 // member running under an unconfirmed route.
 const SWITCH_CONTINUATION_TIMEOUT_MS = 60_000;
 
+// Swarm is a capability switch, not a start button: enabling it only injects the
+// tools. A lead that has never used Swarm gets no signal to consider it, so the
+// first step on an empty board carries this one-shot hint.
+const EMPTY_BOARD_NOTICE = [
+  '[Swarm] Swarm is switched on for this session, but the board still has no teammates.',
+  'If this task is worth splitting, set the goal and add members (swarm action "goal" then "add",',
+  'or /swarm goal ... and /swarm add <name> <task>); the board already exists, so /swarm init is not needed.',
+  'Ignore this notice if working alone is enough. It is delivered once.',
+].join(' ');
+
 function nowMs() {
   return Date.now();
+}
+
+// Count teammates that still carry the board: the lead alone is not a swarm.
+function hasTeammate(board) {
+  return Object.values(board.members ?? {}).some(
+    (member) => member && member.role !== 'coordinator' && member.status !== 'killed',
+  );
 }
 
 function isQuotaFailure(failureValue) {
@@ -210,23 +227,59 @@ export class SwarmHost {
     const entry = this.state.resolve(agent);
     if (!entry) return decision;
     if (decision?.kind !== 'enter') return decision;
+    const messages = [];
+    const notice = await this.emptyBoardNotice(entry, payload);
+    if (notice) messages.push(notice);
     const activity = this.unreadActivity(entry);
-    if (!activity) return decision;
+    if (activity) {
+      try {
+        const message = await this.makeMessage(
+          this.reminderText(entry, activity),
+          `Swarm has ${activity.fresh.length} unread post(s)`,
+        );
+        // A user cancel must win over a queued reminder.
+        if (payload?.signal?.aborted || this.disposed) return decision;
+        this.markReminded(agent.id, activity.latest.seq);
+        void this.ackUnread(entry, activity.latest.seq).catch((error) =>
+          this.log('warn', 'pre-step wake ack failed', error),
+        );
+        messages.unshift(message);
+      } catch (error) {
+        this.log('warn', 'pre-step reminder failed', error);
+      }
+    }
+    if (messages.length === 0) return decision;
+    return { ...decision, messages: [...messages, ...(decision.messages ?? [])] };
+  }
+
+  // The empty-board hint is for a lead that has never used Swarm: once any
+  // teammate has been added (even one later killed by `finish`), the lead has
+  // already seen how the board works. The notice is recorded on the board
+  // before it is returned, so a reload or restart cannot repeat it.
+  async emptyBoardNotice(entry, payload) {
+    const { board } = entry;
+    if (!entry.isRoot || board.enabled === false) return null;
+    if (board.notices?.emptyBoardNudged) return null;
+    const everHadTeammate = Object.values(board.members ?? {}).some(
+      (member) => member && member.role !== 'coordinator',
+    );
+    if (everHadTeammate) return null;
     try {
       const message = await this.makeMessage(
-        this.reminderText(entry, activity),
-        `Swarm has ${activity.fresh.length} unread post(s)`,
+        EMPTY_BOARD_NOTICE,
+        'Swarm is on but the board has no members',
       );
-      // A user cancel must win over a queued reminder.
-      if (payload?.signal?.aborted || this.disposed) return decision;
-      this.markReminded(agent.id, activity.latest.seq);
-      void this.ackUnread(entry, activity.latest.seq).catch((error) =>
-        this.log('warn', 'pre-step wake ack failed', error),
-      );
-      return { ...decision, messages: [message, ...(decision.messages ?? [])] };
+      if (payload?.signal?.aborted || this.disposed) return null;
+      const out = await this.state.act(board.rootId, board.rootId, {
+        type: 'recordNotice',
+        key: 'emptyBoardNudged',
+      });
+      if (out.result?.ok === false) return null;
+      if (payload?.signal?.aborted || this.disposed) return null;
+      return message;
     } catch (error) {
-      this.log('warn', 'pre-step reminder failed', error);
-      return decision;
+      this.log('warn', 'pre-step empty-board notice failed', error);
+      return null;
     }
   }
 
@@ -698,9 +751,7 @@ export class SwarmHost {
     if (!entry?.self || entry.self.status === 'killed') return false;
     if (entry.isRoot) {
       if (entry.board.enabled === false) return false;
-      return Object.values(entry.board.members ?? {}).some(
-        (member) => member.role !== 'coordinator' && member.status !== 'killed',
-      );
+      return hasTeammate(entry.board);
     }
     return true;
   }

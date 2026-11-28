@@ -479,6 +479,59 @@ test('pre-step and turn-stopping derive reminders from a real post to a working 
   assert.equal(canceled.messages.length, 0, 'a canceled step is not blocked by a reminder');
 });
 
+test('a switched-on empty board nudges the lead once to consider splitting', async (t) => {
+  const rt = await setup();
+  t.after(() => rt.host.close());
+  const enter = (signal = new AbortController().signal) => rt.host.preStep(
+    { agent: rt.root, messages: [], turn: 1, step: 1, signal },
+    async () => ({ kind: 'enter', messages: [] }),
+  );
+
+  const first = await enter();
+  assert.equal(first.messages.length, 1);
+  assert.match(first.messages[0].content[0].text, /still has no teammates/);
+  assert.match(first.messages[0].content[0].text, /\/swarm add/);
+  assert.ok(rt.state.board('root').notices.emptyBoardNudged > 0, 'the notice is recorded on the board');
+
+  const second = await enter();
+  assert.equal(second.messages.length, 0, 'the nudge is one-shot');
+
+  const aborted = await setup();
+  t.after(() => aborted.host.close());
+  const canceled = await aborted.host.preStep(
+    { agent: aborted.root, messages: [], turn: 1, step: 1, signal: AbortSignal.abort() },
+    async () => ({ kind: 'enter', messages: [] }),
+  );
+  assert.equal(canceled.messages.length, 0, 'a canceled step is not nudged');
+  assert.equal(aborted.state.board('root').notices, undefined, 'a canceled step records nothing');
+
+  const busy = await setup();
+  t.after(() => busy.host.close());
+  await addAlice(busy);
+  const withTeammate = await busy.host.preStep(
+    { agent: busy.root, messages: [], turn: 1, step: 1, signal: new AbortController().signal },
+    async () => ({ kind: 'enter', messages: [] }),
+  );
+  assert.equal(withTeammate.messages.length, 0, 'a board with a teammate is not empty');
+
+  await busy.host.killMember('root', 'alice');
+  const afterFinish = await busy.host.preStep(
+    { agent: busy.root, messages: [], turn: 1, step: 2, signal: new AbortController().signal },
+    async () => ({ kind: 'enter', messages: [] }),
+  );
+  assert.equal(afterFinish.messages.length, 0, 'a lead that already used Swarm is not nudged after finish');
+  assert.equal(busy.state.board('root').notices, undefined);
+
+  const off = await setup();
+  t.after(() => off.host.close());
+  await off.host.setEnabled('root', false);
+  const disabled = await off.host.preStep(
+    { agent: off.root, messages: [], turn: 1, step: 1, signal: new AbortController().signal },
+    async () => ({ kind: 'enter', messages: [] }),
+  );
+  assert.equal(disabled.messages.length, 0, 'a switched-off board injects nothing');
+});
+
 test('request-error stops retrying after the quota pause threshold', async (t) => {
   const rt = await setup();
   t.after(() => rt.host.close());
