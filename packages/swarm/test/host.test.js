@@ -214,12 +214,48 @@ test('creates a board and spawns a native member with the shared cwd', async (t)
   assert.equal(rt.spawns.length, 1);
   const spec = rt.spawns[0];
   assert.equal(spec.provider, 'spawn');
+  assert.equal(spec.name, added.member.name);
   assert.equal(spec.delivery, 'caller');
   assert.equal(spec.childId, added.sessionId);
   assert.equal(spec.cwd, '/workspace/shared');
   assert.equal(spec.agentPreset, undefined, 'inherits the parent preset, never widens it');
   assert.match(spec.prompt[0].text, /You are "alice"/);
   assert.match(spec.prompt[0].text, /do the task/);
+});
+
+for (const [name, code] of [['Scout_v2', 'INVALID_AGENT_NAME'], ['scout', 'DUPLICATE_AGENT_NAME']]) {
+  test(`native ${code} uses an automatic child name but keeps @${name} on the board`, async (t) => {
+    const rt = await setup();
+    t.after(() => rt.host.close());
+    const attempts = [];
+    rt.ctx.subagents.startActivation = async (spec) => {
+      attempts.push(spec);
+      if (spec.name !== undefined) throw Object.assign(new Error('name not admitted'), { code });
+      return { childId: spec.childId, name: 'agent-1' };
+    };
+    const added = await addAlice(rt, { name });
+    assert.equal(attempts.length, 2);
+    const [named, automatic] = attempts;
+    assert.ok(!Object.hasOwn(automatic, 'name'));
+    assert.deepEqual(named, { ...automatic, name }); // Same child ID, prompt, signal and options.
+    assert.equal(added.handle.name, 'agent-1');
+    assert.equal(rt.state.member('root', added.sessionId).name, name);
+  });
+}
+
+test('cancelling add during name admission does not start an automatic child', async (t) => {
+  const rt = await setup();
+  t.after(() => rt.host.close());
+  const controller = new AbortController();
+  let attempts = 0;
+  rt.ctx.subagents.startActivation = async () => {
+    attempts++;
+    controller.abort(new Error('stop dispatch'));
+    throw Object.assign(new Error('sibling name reserved'), { code: 'DUPLICATE_AGENT_NAME' });
+  };
+  await assert.rejects(addAlice(rt, { signal: controller.signal }), /stop dispatch/);
+  assert.equal(attempts, 1);
+  assert.deepEqual(rt.state.board('root').reservations, {});
 });
 
 test('isolated dispatch persists the delivery record, rejects live/non-root merges, and reconciles delivery once', async (t) => {
@@ -315,12 +351,12 @@ test('requested capabilities fail closed on old hosts, without spawning or reser
 });
 
 test('spawn failure is compensated with failJoin and leaves no member', async (t) => {
-  const rt = makeRuntime({ spawnError: new Error('spawn refused') });
-  await rt.host.start();
-  await rt.state.create(rt.root, 'Swarm', 'lead');
+  const spawnError = Object.assign(new Error('child already exists'), { code: 'DUPLICATE_CHILD' });
+  const rt = await setup({ spawnError });
   t.after(() => rt.host.close());
 
-  await assert.rejects(() => addAlice(rt), /spawn refused/);
+  await assert.rejects(() => addAlice(rt), { code: 'DUPLICATE_CHILD' });
+  assert.equal(rt.spawns.length, 1, 'a duplicate child ID is not a sibling name conflict');
   const board = rt.state.board('root');
   assert.equal(Object.keys(board.members).length, 1, 'coordinator only');
   assert.deepEqual(board.reservations, {});

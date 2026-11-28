@@ -46,6 +46,17 @@ function nowMs() {
   return Date.now();
 }
 
+async function startMemberActivation(subagents, spec, name) {
+  try {
+    return await subagents.startActivation({ ...spec, name });
+  } catch (error) {
+    // DSH checks both catalogued and pending sibling names before starting the child.
+    if (error?.code !== 'INVALID_AGENT_NAME' && error?.code !== 'DUPLICATE_AGENT_NAME') throw error;
+    spec.signal.throwIfAborted();
+    return subagents.startActivation(spec);
+  }
+}
+
 // Count teammates that still carry the board: the lead alone is not a swarm.
 function hasTeammate(board) {
   return Object.values(board.members ?? {}).some(
@@ -1175,7 +1186,7 @@ export class SwarmHost {
           contract: reserved.result.reservation.contract,
           cwd, workspaceMode,
         });
-        activation = await this.ctx.subagents.startActivation({
+        activation = await startMemberActivation(this.ctx.subagents, {
           provider: 'spawn',
           delivery: 'caller',
           parent: rootAgent,
@@ -1188,7 +1199,7 @@ export class SwarmHost {
             ? { maxDepth: this.ctx.subagents.resolveMaxDepth() }
             : {}),
           label: `swarm:${cleanName}`,
-        });
+        }, cleanName);
         if (!activation || activation.childId !== sessionId) {
           throw failure('SPAWN_FAILED', 'subagent returned an unexpected child id');
         }
