@@ -9,7 +9,6 @@ const USAGE = [
   '',
   '/swarm init [title]                 Create the board for this root session',
   '/swarm add <name> [flags] <task>    Spawn a teammate (alias: start)',
-  '  DSH uses the board name if valid and free among siblings; otherwise only the child gets an automatic name.',
   '  flags: --role worker|monitor  --channel <name>  --wake mentions|anything',
   '         --worktree  --model <provider/model>  --fallback <provider/model>  -- <literal task>',
   '         --contract <taskId> "<deliverable>" "<criterion>" -- <task>  (optional first-turn acceptance contract)',
